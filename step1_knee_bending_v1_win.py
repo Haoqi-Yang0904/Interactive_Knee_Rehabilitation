@@ -12,7 +12,10 @@ import tempfile
 import threading
 import sys
 import platform
+import warnings
 from collections import deque
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -63,6 +66,8 @@ WINDOW_NAME = "Knee Angle PoC"
 WINDOW_INITIAL_WIDTH = int(os.getenv("WINDOW_INITIAL_WIDTH", "960"))
 WINDOW_INITIAL_HEIGHT = int(os.getenv("WINDOW_INITIAL_HEIGHT", "720"))
 OVERLAY_UI_SCALE = float(os.getenv("OVERLAY_UI_SCALE", "0.67"))
+CAPTURE_ROOT_DIRNAME = "test_pose"
+PROGRAM_START_TIMESTAMP = time.time()
 
 FEEDBACK_MESSAGES = {
     "far": [
@@ -119,6 +124,7 @@ voice_process = None
 active_voice_stage = None
 angle_history = deque(maxlen=60)
 overlay_font_cache = {}
+pygame_playback_lock = threading.Lock()
 
 LEG_LANDMARKS = {
     "left": {
@@ -210,6 +216,10 @@ def pywin32_sapi_is_installed():
     )
 
 
+def pygame_is_installed():
+    return importlib.util.find_spec("pygame") is not None
+
+
 def get_windows_speech_rate():
     try:
         rate = int(WINDOWS_SPEECH_RATE)
@@ -272,46 +282,37 @@ def get_audio_player_command():
 
 
 def audio_playback_is_available():
-    return (is_windows() and pywin32_sapi_is_installed()) or get_audio_player_command() is not None
+    return (is_windows() and pygame_is_installed()) or get_audio_player_command() is not None
 
 
-def play_audio_with_windows_media_player(audio_path):
-    import pythoncom
-    from win32com.client import Dispatch
+def play_audio_with_pygame(audio_path):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="pkg_resources is deprecated as an API.*",
+            category=UserWarning,
+        )
+        import pygame
 
-    pythoncom.CoInitialize()
-    player = None
-    try:
-        player = Dispatch("WMPlayer.OCX")
-        player.settings.volume = 100
-        player.URL = os.path.abspath(audio_path)
-        player.controls.play()
+    with pygame_playback_lock:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
 
-        started = False
-        start_deadline = time.time() + 5.0
-        end_deadline = time.time() + 60.0
-        while time.time() < end_deadline:
-            play_state = player.playState
-            if play_state == 3:
-                started = True
-            if started and play_state in (1, 8):
-                break
-            if not started and time.time() > start_deadline:
-                raise RuntimeError("Windows Media Player 没有开始播放音频")
-            time.sleep(0.05)
-    finally:
-        if player is not None:
-            try:
-                player.controls.stop()
-                player.close()
-            except Exception:
-                pass
-        pythoncom.CoUninitialize()
+        pygame.mixer.music.load(audio_path)
+        pygame.mixer.music.play()
+        clock = pygame.time.Clock()
+        while pygame.mixer.music.get_busy():
+            clock.tick(30)
+
+        try:
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
 
 
 def play_audio_file(audio_path, audio_player=None):
     if is_windows():
-        play_audio_with_windows_media_player(audio_path)
+        play_audio_with_pygame(audio_path)
         return
 
     if audio_player is None:
@@ -1412,6 +1413,51 @@ def resize_for_display(image):
     return display_image
 
 
+def format_capture_timestamp(timestamp=None, include_milliseconds=False):
+    if timestamp is None:
+        timestamp = time.time()
+
+    label = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(timestamp))
+    if include_milliseconds:
+        milliseconds = int((timestamp % 1.0) * 1000)
+        label = f"{label}_{milliseconds:03d}"
+    return label
+
+
+def create_capture_session_dir():
+    capture_root = os.path.join(os.getcwd(), CAPTURE_ROOT_DIRNAME)
+    os.makedirs(capture_root, exist_ok=True)
+
+    session_label = format_capture_timestamp(PROGRAM_START_TIMESTAMP)
+    session_dir = os.path.join(capture_root, session_label)
+    if not os.path.exists(session_dir):
+        os.makedirs(session_dir)
+        return session_dir
+
+    suffix = 2
+    while True:
+        candidate = os.path.join(capture_root, f"{session_label}_{suffix}")
+        if not os.path.exists(candidate):
+            os.makedirs(candidate)
+            return candidate
+        suffix += 1
+
+
+def save_pose_capture(image, capture_session_dir):
+    timestamp_label = format_capture_timestamp(include_milliseconds=True)
+    filename = f"test_pose_{timestamp_label}.jpg"
+    image_path = os.path.join(capture_session_dir, filename)
+
+    suffix = 2
+    while os.path.exists(image_path):
+        filename = f"test_pose_{timestamp_label}_{suffix}.jpg"
+        image_path = os.path.join(capture_session_dir, filename)
+        suffix += 1
+
+    cv2.imwrite(image_path, image)
+    return image_path
+
+
 def get_camera_index_candidates():
     if CAMERA_INDEX is not None:
         try:
@@ -1470,6 +1516,8 @@ def open_preferred_camera():
 # 打开电脑主摄像头
 cap = open_preferred_camera()
 create_display_window()
+capture_session_dir = create_capture_session_dir()
+print(f"📁 本次截图保存目录：{capture_session_dir}")
 
 # 用于自动截图的计时器变量
 last_capture_time = time.time()
@@ -1750,8 +1798,8 @@ with mp_pose.Pose(
             )
 
         if time_elapsed >= capture_interval:
-            cv2.imwrite('test_pose.jpg', image)
-            print("📸 [全自动] 无需按键，已截取最新姿态并覆盖 'test_pose.jpg' 供大模型测试使用！")
+            capture_path = save_pose_capture(image, capture_session_dir)
+            print(f"📸 [全自动] 已保存最新姿态截图：{capture_path}")
             # 屏幕闪烁一下（画一个白色的半透明层）
             overlay = image.copy()
             cv2.rectangle(overlay, (0, 0), (image.shape[1], image.shape[0]), (255, 255, 255), -1)
@@ -1769,8 +1817,8 @@ with mp_pose.Pose(
         if key == ord('q'):
             break
         elif key == ord('s'):
-            cv2.imwrite('test_pose.jpg', image)
-            print("📸 已截取当前姿态并保存为 'test_pose.jpg'，你可以用它来测试大模型的评估效果！")
+            capture_path = save_pose_capture(image, capture_session_dir)
+            print(f"📸 已截取当前姿态并保存为：{capture_path}")
 
 cap.release()
 cv2.destroyAllWindows()
