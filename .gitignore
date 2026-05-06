@@ -5,3 +5,6 @@ __pycache__/
 
 # Auto-generated pose screenshot
 test_pose.jpg
+
+# Auto-generated test audio
+edge_test.mp3

@@ -271,6 +271,62 @@ def get_audio_player_command():
     return None
 
 
+def audio_playback_is_available():
+    return (is_windows() and pywin32_sapi_is_installed()) or get_audio_player_command() is not None
+
+
+def play_audio_with_windows_media_player(audio_path):
+    import pythoncom
+    from win32com.client import Dispatch
+
+    pythoncom.CoInitialize()
+    player = None
+    try:
+        player = Dispatch("WMPlayer.OCX")
+        player.settings.volume = 100
+        player.URL = os.path.abspath(audio_path)
+        player.controls.play()
+
+        started = False
+        start_deadline = time.time() + 5.0
+        end_deadline = time.time() + 60.0
+        while time.time() < end_deadline:
+            play_state = player.playState
+            if play_state == 3:
+                started = True
+            if started and play_state in (1, 8):
+                break
+            if not started and time.time() > start_deadline:
+                raise RuntimeError("Windows Media Player 没有开始播放音频")
+            time.sleep(0.05)
+    finally:
+        if player is not None:
+            try:
+                player.controls.stop()
+                player.close()
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+
+
+def play_audio_file(audio_path, audio_player=None):
+    if is_windows():
+        play_audio_with_windows_media_player(audio_path)
+        return
+
+    if audio_player is None:
+        audio_player = get_audio_player_command()
+    if audio_player is None:
+        raise RuntimeError("找不到可用音频播放器")
+
+    subprocess.run(
+        audio_player + [audio_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 macos_say_command = None if is_windows() else get_macos_say_command()
 
 
@@ -382,13 +438,13 @@ class EdgeTTSEngine:
 
     def __init__(self):
         self.audio_player = get_audio_player_command()
-        self.disabled = self.audio_player is None
+        self.disabled = not audio_playback_is_available()
         self.busy = False
         self.message_queue = queue.Queue(maxsize=1)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-        if self.audio_player is None:
+        if self.disabled:
             print("⚠️ 找不到可用音频播放器，edge-tts 暂时不能播放音频，将回退到系统语音。")
 
     def is_busy(self):
@@ -425,12 +481,7 @@ class EdgeTTSEngine:
                     audio_path = audio_file.name
 
                 asyncio.run(self._save_audio(text, audio_path))
-                subprocess.run(
-                    self.audio_player + [audio_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
+                play_audio_file(audio_path, self.audio_player)
             except Exception as exc:
                 print(f"⚠️ edge-tts 播放失败，后续将回退到系统语音：{exc}")
                 self.disabled = True
@@ -446,9 +497,6 @@ class EdgeTTSEngine:
 
 def create_edge_tts_engine():
     if TTS_ENGINE not in ("auto", "edge"):
-        return None
-
-    if is_windows() and pywin32_sapi_is_installed():
         return None
 
     if not edge_tts_is_installed():
@@ -479,7 +527,7 @@ class MeloTTSEngine:
 
     def __init__(self):
         self.audio_player = get_audio_player_command()
-        self.disabled = self.audio_player is None
+        self.disabled = not audio_playback_is_available()
         self.busy = False
         self.model = None
         self.speaker_id = None
@@ -487,7 +535,7 @@ class MeloTTSEngine:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-        if self.audio_player is None:
+        if self.disabled:
             print("⚠️ 找不到可用音频播放器，MeloTTS 暂时不能播放音频，将回退到系统语音。")
 
     def is_busy(self):
@@ -542,12 +590,7 @@ class MeloTTSEngine:
                     audio_path,
                     speed=MELO_SPEED,
                 )
-                subprocess.run(
-                    self.audio_player + [audio_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
+                play_audio_file(audio_path, self.audio_player)
             except Exception as exc:
                 print(f"⚠️ MeloTTS 播放失败，后续将回退到系统语音：{exc}")
                 self.disabled = True
@@ -563,9 +606,6 @@ class MeloTTSEngine:
 
 def create_melotts_engine():
     if TTS_ENGINE not in ("auto", "melo"):
-        return None
-
-    if is_windows() and pywin32_sapi_is_installed():
         return None
 
     if not melotts_is_installed():
@@ -1034,14 +1074,6 @@ def speak(text, stage):
     """非阻塞语音播报；没有 TTS 时退化为终端输出。"""
     global voice_process, active_voice_stage
 
-    if windows_sapi_engine is not None and not windows_sapi_engine.disabled:
-        if not windows_sapi_engine.speak(text):
-            return False
-
-        print(f"🔊 康复提示：{text}")
-        active_voice_stage = stage
-        return True
-
     if edge_tts_engine is not None and not edge_tts_engine.disabled:
         if not edge_tts_engine.speak(text):
             return False
@@ -1052,6 +1084,14 @@ def speak(text, stage):
 
     if melo_tts_engine is not None and not melo_tts_engine.disabled:
         if not melo_tts_engine.speak(text):
+            return False
+
+        print(f"🔊 康复提示：{text}")
+        active_voice_stage = stage
+        return True
+
+    if windows_sapi_engine is not None and not windows_sapi_engine.disabled:
+        if not windows_sapi_engine.speak(text):
             return False
 
         print(f"🔊 康复提示：{text}")
@@ -1356,8 +1396,20 @@ def resize_for_display(image):
     if display_width == image_width and display_height == image_height:
         return image
 
-    interpolation = cv2.INTER_AREA if display_width < image_width or display_height < image_height else cv2.INTER_LINEAR
-    return cv2.resize(image, (display_width, display_height), interpolation=interpolation)
+    scale = min(display_width / image_width, display_height / image_height)
+    scaled_width = max(1, int(round(image_width * scale)))
+    scaled_height = max(1, int(round(image_height * scale)))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized_image = cv2.resize(image, (scaled_width, scaled_height), interpolation=interpolation)
+
+    display_image = np.zeros((display_height, display_width, 3), dtype=image.dtype)
+    x_offset = (display_width - scaled_width) // 2
+    y_offset = (display_height - scaled_height) // 2
+    display_image[
+        y_offset : y_offset + scaled_height,
+        x_offset : x_offset + scaled_width,
+    ] = resized_image
+    return display_image
 
 
 def get_camera_index_candidates():
