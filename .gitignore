@@ -1,0 +1,7 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Auto-generated pose screenshot
+test_pose.jpg

@@ -11,6 +11,7 @@ import queue
 import tempfile
 import threading
 import sys
+import platform
 from collections import deque
 
 try:
@@ -29,6 +30,7 @@ TARGET_KNEE_FLEXION_ANGLE = 120.0
 VOICE_COOLDOWN_SECONDS = 7.0
 SAY_RATE = os.getenv("SAY_RATE", "155")
 SAY_VOICE = os.getenv("SAY_VOICE", "")
+WINDOWS_SPEECH_RATE = os.getenv("WINDOWS_SPEECH_RATE", "0")
 TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()
 EDGE_VOICE = os.getenv("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 EDGE_RATE = os.getenv("EDGE_RATE", "-10%")
@@ -57,6 +59,10 @@ ANGLE_SMOOTHING_ALPHA = float(os.getenv("ANGLE_SMOOTHING_ALPHA", "0.30"))
 CAMERA_INDEX = os.getenv("CAMERA_INDEX")
 CAMERA_MAX_PROBE_INDEX = int(os.getenv("CAMERA_MAX_PROBE_INDEX", "5"))
 PREFER_MAC_BUILTIN_CAMERA = os.getenv("PREFER_MAC_BUILTIN_CAMERA", "1") == "1"
+WINDOW_NAME = "Knee Angle PoC"
+WINDOW_INITIAL_WIDTH = int(os.getenv("WINDOW_INITIAL_WIDTH", "960"))
+WINDOW_INITIAL_HEIGHT = int(os.getenv("WINDOW_INITIAL_HEIGHT", "720"))
+OVERLAY_UI_SCALE = float(os.getenv("OVERLAY_UI_SCALE", "0.67"))
 
 FEEDBACK_MESSAGES = {
     "far": [
@@ -166,6 +172,9 @@ tracking_state = {
 }
 
 FONT_SEARCH_DIRECTORIES = [
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
+    os.path.expanduser("~/AppData/Local/Microsoft/Windows/Fonts"),
     os.path.expanduser("~/Library/Fonts"),
     "/Library/Fonts",
     "/System/Library/Fonts",
@@ -173,6 +182,15 @@ FONT_SEARCH_DIRECTORIES = [
 ]
 
 FONT_CANDIDATE_FILENAMES = [
+    "msyh.ttc",
+    "msyhbd.ttc",
+    "simhei.ttf",
+    "simsun.ttc",
+    "simkai.ttf",
+    "Deng.ttf",
+    "Dengb.ttf",
+    "NotoSansCJK-Regular.ttc",
+    "NotoSansSC-Regular.otf",
     "Arial Unicode.ttf",
     "PingFang.ttc",
     "Hiragino Sans GB.ttc",
@@ -181,8 +199,27 @@ FONT_CANDIDATE_FILENAMES = [
 ]
 
 
-def get_say_command():
-    """优先使用 macOS 自带 say 命令，并尽量选择中文语音。"""
+def is_windows():
+    return platform.system().lower() == "windows"
+
+
+def pywin32_sapi_is_installed():
+    return (
+        importlib.util.find_spec("pythoncom") is not None
+        and importlib.util.find_spec("win32com") is not None
+    )
+
+
+def get_windows_speech_rate():
+    try:
+        rate = int(WINDOWS_SPEECH_RATE)
+    except ValueError:
+        rate = 0
+    return max(-10, min(10, rate))
+
+
+def get_macos_say_command():
+    """保留 macOS say 命令作为跨平台兜底。"""
     say_path = shutil.which("say")
     if not say_path:
         return None
@@ -216,7 +253,124 @@ def get_say_command():
     return [say_path, "-r", SAY_RATE]
 
 
-say_command = get_say_command()
+def get_audio_player_command():
+    """返回能同步播放 mp3/wav 的命令前缀，后续追加音频路径。"""
+    if is_windows():
+        return None
+
+    for player in ("afplay", "ffplay", "mpg123", "mpv", "play"):
+        player_path = shutil.which(player)
+        if not player_path:
+            continue
+        if player == "ffplay":
+            return [player_path, "-nodisp", "-autoexit", "-loglevel", "quiet"]
+        if player == "mpv":
+            return [player_path, "--no-video", "--really-quiet"]
+        return [player_path]
+
+    return None
+
+
+macos_say_command = None if is_windows() else get_macos_say_command()
+
+
+class WindowsSAPIEngine:
+    """用 pywin32 直接调用 Windows SAPI，避免通过外部命令播报。"""
+
+    def __init__(self):
+        self.disabled = False
+        self.busy = False
+        self.speaker = None
+        self.message_queue = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def is_busy(self):
+        return self.busy or not self.message_queue.empty()
+
+    def speak(self, text):
+        if self.disabled or self.is_busy():
+            return False
+
+        try:
+            self.message_queue.put_nowait(text)
+            return True
+        except queue.Full:
+            return False
+
+    def _select_chinese_voice(self):
+        preferred_voice = SAY_VOICE.strip()
+        try:
+            voices = self.speaker.GetVoices()
+            fallback_voice = None
+            for index in range(voices.Count):
+                voice = voices.Item(index)
+                description = voice.GetDescription()
+                language = voice.GetAttribute("Language")
+                is_chinese = "804" in language.lower() or "chinese" in description.lower()
+
+                if preferred_voice and preferred_voice.lower() in description.lower():
+                    self.speaker.Voice = voice
+                    return description
+
+                if fallback_voice is None and is_chinese:
+                    fallback_voice = voice
+
+            if fallback_voice is not None:
+                self.speaker.Voice = fallback_voice
+                return fallback_voice.GetDescription()
+        except Exception:
+            pass
+
+        try:
+            return self.speaker.Voice.GetDescription()
+        except Exception:
+            return "Windows 默认语音"
+
+    def _ensure_speaker(self):
+        if self.speaker is not None:
+            return True
+
+        try:
+            import pythoncom
+            from win32com.client import Dispatch
+
+            pythoncom.CoInitialize()
+            self.speaker = Dispatch("SAPI.SpVoice")
+            self.speaker.Rate = get_windows_speech_rate()
+            self.speaker.Volume = 100
+            voice_name = self._select_chinese_voice()
+            print(f"✅ Windows SAPI 语音已就绪：{voice_name}")
+            return True
+        except Exception as exc:
+            print(f"⚠️ Windows SAPI 初始化失败，后续只输出文字提示：{exc}")
+            self.disabled = True
+            return False
+
+    def _run(self):
+        while True:
+            text = self.message_queue.get()
+            self.busy = True
+            try:
+                if self._ensure_speaker():
+                    self.speaker.Speak(text)
+            except Exception as exc:
+                print(f"⚠️ Windows SAPI 播报失败，后续只输出文字提示：{exc}")
+                self.disabled = True
+            finally:
+                self.busy = False
+                self.message_queue.task_done()
+
+
+def create_windows_sapi_engine():
+    if not is_windows():
+        return None
+
+    if not pywin32_sapi_is_installed():
+        print("⚠️ 没有安装 pywin32，无法启用 Windows SAPI 语音。")
+        return None
+
+    return WindowsSAPIEngine()
 
 
 def edge_tts_is_installed():
@@ -227,7 +381,7 @@ class EdgeTTSEngine:
     """使用 edge-tts 在线神经网络音色，失败时禁用并回退到系统语音。"""
 
     def __init__(self):
-        self.audio_player = shutil.which("afplay")
+        self.audio_player = get_audio_player_command()
         self.disabled = self.audio_player is None
         self.busy = False
         self.message_queue = queue.Queue(maxsize=1)
@@ -235,7 +389,7 @@ class EdgeTTSEngine:
         self.thread.start()
 
         if self.audio_player is None:
-            print("⚠️ 找不到 afplay，edge-tts 暂时不能播放音频，将回退到系统语音。")
+            print("⚠️ 找不到可用音频播放器，edge-tts 暂时不能播放音频，将回退到系统语音。")
 
     def is_busy(self):
         return self.busy or not self.message_queue.empty()
@@ -272,7 +426,7 @@ class EdgeTTSEngine:
 
                 asyncio.run(self._save_audio(text, audio_path))
                 subprocess.run(
-                    [self.audio_player, audio_path],
+                    self.audio_player + [audio_path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,
@@ -292,6 +446,9 @@ class EdgeTTSEngine:
 
 def create_edge_tts_engine():
     if TTS_ENGINE not in ("auto", "edge"):
+        return None
+
+    if is_windows() and pywin32_sapi_is_installed():
         return None
 
     if not edge_tts_is_installed():
@@ -321,7 +478,7 @@ class MeloTTSEngine:
     """后台合成和播放，避免 TTS 阻塞摄像头画面。"""
 
     def __init__(self):
-        self.audio_player = shutil.which("afplay")
+        self.audio_player = get_audio_player_command()
         self.disabled = self.audio_player is None
         self.busy = False
         self.model = None
@@ -331,7 +488,7 @@ class MeloTTSEngine:
         self.thread.start()
 
         if self.audio_player is None:
-            print("⚠️ 找不到 afplay，MeloTTS 暂时不能播放音频，将回退到系统语音。")
+            print("⚠️ 找不到可用音频播放器，MeloTTS 暂时不能播放音频，将回退到系统语音。")
 
     def is_busy(self):
         return self.busy or not self.message_queue.empty()
@@ -386,7 +543,7 @@ class MeloTTSEngine:
                     speed=MELO_SPEED,
                 )
                 subprocess.run(
-                    [self.audio_player, audio_path],
+                    self.audio_player + [audio_path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,
@@ -408,6 +565,9 @@ def create_melotts_engine():
     if TTS_ENGINE not in ("auto", "melo"):
         return None
 
+    if is_windows() and pywin32_sapi_is_installed():
+        return None
+
     if not melotts_is_installed():
         if TTS_ENGINE == "melo":
             print("⚠️ 没有安装 MeloTTS，将回退到系统语音。")
@@ -416,6 +576,7 @@ def create_melotts_engine():
     return MeloTTSEngine()
 
 
+windows_sapi_engine = create_windows_sapi_engine()
 edge_tts_engine = create_edge_tts_engine()
 melo_tts_engine = create_melotts_engine()
 
@@ -442,6 +603,10 @@ def get_overlay_font(font_size):
     font = ImageFont.load_default()
     overlay_font_cache[font_size] = font
     return font
+
+
+def scale_overlay_value(value, minimum=1):
+    return max(minimum, int(round(value * OVERLAY_UI_SCALE)))
 
 
 class OverlayPainter:
@@ -477,6 +642,15 @@ class OverlayPainter:
         if draw is None:
             return
 
+        font_size = scale_overlay_value(font_size, minimum=12)
+        padding = (
+            scale_overlay_value(padding[0], minimum=6),
+            scale_overlay_value(padding[1], minimum=5),
+        )
+        line_spacing = scale_overlay_value(line_spacing, minimum=4)
+        panel_radius = scale_overlay_value(20, minimum=8)
+        outline_width = scale_overlay_value(2, minimum=1)
+
         font = get_overlay_font(font_size)
         x, y = origin
         text_sizes = []
@@ -495,9 +669,9 @@ class OverlayPainter:
         x = int(np.clip(x, 10, max(10, frame_width - panel_width - 10)))
         y = int(np.clip(y, 10, max(10, frame_height - panel_height - 10)))
         panel_bounds = (x, y, x + panel_width, y + panel_height)
-        draw.rounded_rectangle(panel_bounds, radius=20, fill=panel_fill)
+        draw.rounded_rectangle(panel_bounds, radius=panel_radius, fill=panel_fill)
         if outline_fill is not None:
-            draw.rounded_rectangle(panel_bounds, radius=20, outline=outline_fill, width=2)
+            draw.rounded_rectangle(panel_bounds, radius=panel_radius, outline=outline_fill, width=outline_width)
 
         cursor_y = y + padding[1]
         for line, (_, text_height) in zip(lines, text_sizes):
@@ -860,6 +1034,14 @@ def speak(text, stage):
     """非阻塞语音播报；没有 TTS 时退化为终端输出。"""
     global voice_process, active_voice_stage
 
+    if windows_sapi_engine is not None and not windows_sapi_engine.disabled:
+        if not windows_sapi_engine.speak(text):
+            return False
+
+        print(f"🔊 康复提示：{text}")
+        active_voice_stage = stage
+        return True
+
     if edge_tts_engine is not None and not edge_tts_engine.disabled:
         if not edge_tts_engine.speak(text):
             return False
@@ -880,13 +1062,13 @@ def speak(text, stage):
         return False
 
     print(f"🔊 康复提示：{text}")
-    if say_command is None:
+    if macos_say_command is None:
         active_voice_stage = stage
         return True
 
     try:
         voice_process = subprocess.Popen(
-            say_command + [text],
+            macos_say_command + [text],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1132,7 +1314,50 @@ def draw_progress_bar(image, top_left, width, height, progress, fill_color):
     progress = float(np.clip(progress, 0.0, 1.0))
     cv2.rectangle(image, (x, y), (x + width, y + height), (40, 52, 72), -1)
     cv2.rectangle(image, (x, y), (x + int(width * progress), y + height), fill_color, -1)
-    cv2.rectangle(image, (x, y), (x + width, y + height), (255, 255, 255), 2)
+    cv2.rectangle(
+        image,
+        (x, y),
+        (x + width, y + height),
+        (255, 255, 255),
+        scale_overlay_value(2, minimum=1),
+    )
+
+
+def create_display_window():
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, WINDOW_INITIAL_WIDTH, WINDOW_INITIAL_HEIGHT)
+
+    try:
+        cv2.setWindowProperty(
+            WINDOW_NAME,
+            cv2.WND_PROP_ASPECT_RATIO,
+            cv2.WINDOW_FREERATIO,
+        )
+    except (AttributeError, cv2.error):
+        pass
+
+
+def get_display_window_size(fallback_image):
+    fallback_height, fallback_width = fallback_image.shape[:2]
+    try:
+        _, _, window_width, window_height = cv2.getWindowImageRect(WINDOW_NAME)
+    except cv2.error:
+        return fallback_width, fallback_height
+
+    if window_width <= 1 or window_height <= 1:
+        return fallback_width, fallback_height
+
+    return int(window_width), int(window_height)
+
+
+def resize_for_display(image):
+    display_width, display_height = get_display_window_size(image)
+    image_height, image_width = image.shape[:2]
+    if display_width == image_width and display_height == image_height:
+        return image
+
+    interpolation = cv2.INTER_AREA if display_width < image_width or display_height < image_height else cv2.INTER_LINEAR
+    return cv2.resize(image, (display_width, display_height), interpolation=interpolation)
 
 
 def get_camera_index_candidates():
@@ -1192,6 +1417,7 @@ def open_preferred_camera():
 
 # 打开电脑主摄像头
 cap = open_preferred_camera()
+create_display_window()
 
 # 用于自动截图的计时器变量
 last_capture_time = time.time()
@@ -1319,11 +1545,14 @@ with mp_pose.Pose(
                 cv2.putText(
                     image,
                     f"{int(round(angle))}deg",
-                    (knee_pixel[0] + 12, knee_pixel[1] - 12),
+                    (
+                        knee_pixel[0] + scale_overlay_value(12, minimum=6),
+                        knee_pixel[1] - scale_overlay_value(12, minimum=6),
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
+                    0.9 * OVERLAY_UI_SCALE,
                     (0, 0, 255),
-                    3,
+                    scale_overlay_value(3, minimum=1),
                     cv2.LINE_AA,
                 )
         else:
@@ -1421,7 +1650,7 @@ with mp_pose.Pose(
         painter = OverlayPainter(image)
         painter.draw_panel(
             info_lines,
-            (20, 20),
+            (scale_overlay_value(20, minimum=8), scale_overlay_value(20, minimum=8)),
             font_size=26,
             text_fill=(240, 248, 255, 255),
             panel_fill=(15, 23, 42, 196),
@@ -1429,7 +1658,10 @@ with mp_pose.Pose(
         )
         painter.draw_panel(
             action_lines,
-            (20, image.shape[0] - 140),
+            (
+                scale_overlay_value(20, minimum=8),
+                image.shape[0] - scale_overlay_value(140, minimum=70),
+            ),
             font_size=28,
             **action_panel_style,
         )
@@ -1440,7 +1672,10 @@ with mp_pose.Pose(
         if time_left > 0:
             painter.draw_panel(
                 [f"自动截图倒计时：{int(time_left) + 1} 秒"],
-                (image.shape[1] - 290, 20),
+                (
+                    image.shape[1] - scale_overlay_value(290, minimum=160),
+                    scale_overlay_value(20, minimum=8),
+                ),
                 font_size=24,
                 text_fill=(235, 255, 242, 255),
                 panel_fill=(18, 90, 52, 196),
@@ -1452,9 +1687,12 @@ with mp_pose.Pose(
         if feedback_stage in ("target", "hold", "rest"):
             draw_progress_bar(
                 image,
-                (20, 140),
-                260,
-                18,
+                (
+                    scale_overlay_value(20, minimum=8),
+                    scale_overlay_value(140, minimum=70),
+                ),
+                scale_overlay_value(260, minimum=120),
+                scale_overlay_value(18, minimum=8),
                 min(hold_seconds / HOLD_GOAL_SECONDS, 1.0) if HOLD_GOAL_SECONDS > 0 else 1.0,
                 fill_color=(84, 214, 44) if feedback_stage != "rest" else (0, 191, 165),
             )
@@ -1471,7 +1709,8 @@ with mp_pose.Pose(
             last_capture_time = current_time
 
         # 6. 显示画面
-        cv2.imshow('Knee Angle PoC', image)
+        display_image = resize_for_display(image)
+        cv2.imshow(WINDOW_NAME, display_image)
         
         # 按 'q' 键退出，按 's' 键手动截取
         key = cv2.waitKey(10) & 0xFF
