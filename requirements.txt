@@ -7,7 +7,7 @@ Pillow==12.2.0
 # Windows system speech / COM support for step1_knee_bending_v1_win.py
 pywin32==311; sys_platform == "win32"
 
-# Optional online neural TTS backend used when TTS_ENGINE=edge
+# Cached neural TTS audio generation/playback for feedback prompts
 edge-tts==7.2.8
 pygame==2.6.1
 

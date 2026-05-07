@@ -5,6 +5,7 @@ import time
 import shutil
 import subprocess
 import os
+import hashlib
 import importlib.util
 import asyncio
 import queue
@@ -34,10 +35,11 @@ VOICE_COOLDOWN_SECONDS = 7.0
 SAY_RATE = os.getenv("SAY_RATE", "155")
 SAY_VOICE = os.getenv("SAY_VOICE", "")
 WINDOWS_SPEECH_RATE = os.getenv("WINDOWS_SPEECH_RATE", "0")
-TTS_ENGINE = os.getenv("TTS_ENGINE", "system").lower()
+TTS_ENGINE = os.getenv("TTS_ENGINE", "edge_cache").lower()
 EDGE_VOICE = os.getenv("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 EDGE_RATE = os.getenv("EDGE_RATE", "-10%")
 EDGE_VOLUME = os.getenv("EDGE_VOLUME", "+0%")
+FEEDBACK_AUDIO_DIR = os.path.abspath(os.path.expanduser(os.getenv("FEEDBACK_AUDIO_DIR", "feedback_audio")))
 MELO_DEVICE = os.getenv("MELO_DEVICE", "auto")
 MELO_SPEED = float(os.getenv("MELO_SPEED", "0.95"))
 MELO_SPEAKER = os.getenv("MELO_SPEAKER", "ZH")
@@ -459,6 +461,263 @@ def edge_tts_is_installed():
     return importlib.util.find_spec("edge_tts") is not None
 
 
+def tts_engine_uses_cached_edge_audio():
+    return TTS_ENGINE in {"edge", "edge_cache", "cached_edge", "edge-cached", "cached-edge"}
+
+
+def get_feedback_audio_filename(stage, index, text):
+    cache_key = f"{EDGE_VOICE}|{EDGE_RATE}|{EDGE_VOLUME}|{text}"
+    text_hash = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:10]
+    return f"{stage}_{index + 1:02d}_{text_hash}.mp3"
+
+
+def build_feedback_audio_paths():
+    audio_paths = {}
+    for stage, messages in FEEDBACK_MESSAGES.items():
+        for index, text in enumerate(messages):
+            filename = get_feedback_audio_filename(stage, index, text)
+            audio_paths[text] = os.path.join(FEEDBACK_AUDIO_DIR, filename)
+    return audio_paths
+
+
+class CachedEdgeAudioEngine:
+    """启动时缓存 edge-tts 音频，运行时只播放本地文件。"""
+
+    def __init__(self):
+        self.audio_player = get_audio_player_command()
+        self.audio_path_by_text = build_feedback_audio_paths()
+        self.disabled = not audio_playback_is_available()
+        self.busy = False
+        self.message_queue = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.current_process = None
+        self.process_lock = threading.Lock()
+        self.mixer_lock = threading.RLock()
+        self.pygame = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+        self._prepare_audio_cache()
+
+        if self.disabled:
+            print("⚠️ 找不到可用音频播放器，缓存语音暂时不能播放，将回退到系统语音。")
+        else:
+            self.thread.start()
+
+    def is_busy(self):
+        return self.busy or not self.message_queue.empty()
+
+    def _drop_pending_message(self):
+        try:
+            self.message_queue.get_nowait()
+            self.message_queue.task_done()
+            return True
+        except queue.Empty:
+            return False
+
+    def clear_pending_messages(self):
+        while self._drop_pending_message():
+            pass
+
+    def _missing_audio_items(self):
+        missing = []
+        for text, audio_path in self.audio_path_by_text.items():
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                missing.append((text, audio_path))
+        return missing
+
+    def _prepare_audio_cache(self):
+        os.makedirs(FEEDBACK_AUDIO_DIR, exist_ok=True)
+        missing = self._missing_audio_items()
+        total = len(self.audio_path_by_text)
+
+        if not missing:
+            print(f"✅ 已找到 {total} 条缓存语音：{FEEDBACK_AUDIO_DIR}")
+            return
+
+        if not edge_tts_is_installed():
+            print(f"⚠️ 缺少 {len(missing)} 条缓存语音，但没有安装 edge-tts，将回退到系统语音。")
+            return
+
+        print(f"🎧 正在生成 {len(missing)} 条 edge-tts 缓存语音：{FEEDBACK_AUDIO_DIR}")
+        failed_count = asyncio.run(self._generate_missing_audio(missing))
+        if failed_count:
+            print(f"⚠️ 有 {failed_count} 条语音缓存生成失败，缺失时会回退到系统语音。")
+        else:
+            print("✅ edge-tts 缓存语音已准备好。")
+
+    async def _generate_missing_audio(self, missing):
+        import edge_tts
+
+        failed_count = 0
+        total = len(missing)
+        for position, (text, audio_path) in enumerate(missing, start=1):
+            temp_audio_path = f"{os.path.splitext(audio_path)[0]}.part.mp3"
+            try:
+                print(f"  [{position}/{total}] {text[:28]}")
+                communicate = edge_tts.Communicate(
+                    text,
+                    EDGE_VOICE,
+                    rate=EDGE_RATE,
+                    volume=EDGE_VOLUME,
+                )
+                await communicate.save(temp_audio_path)
+                os.replace(temp_audio_path, audio_path)
+            except Exception as exc:
+                failed_count += 1
+                print(f"⚠️ 生成缓存语音失败：{text}；原因：{exc}")
+                if os.path.exists(temp_audio_path):
+                    try:
+                        os.remove(temp_audio_path)
+                    except OSError:
+                        pass
+
+        return failed_count
+
+    def speak(self, text, interrupt=False):
+        if self.disabled:
+            return False
+
+        audio_path = self.audio_path_by_text.get(text)
+        if not audio_path or not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            return False
+
+        if interrupt:
+            self.clear_pending_messages()
+            self.stop_current_playback()
+
+        try:
+            self.message_queue.put_nowait((text, audio_path))
+            return True
+        except queue.Full:
+            self._drop_pending_message()
+            try:
+                self.message_queue.put_nowait((text, audio_path))
+                return True
+            except queue.Full:
+                return False
+
+    def stop_current_playback(self):
+        self.stop_event.set()
+        if is_windows():
+            with self.mixer_lock:
+                if self.pygame is not None and self.pygame.mixer.get_init():
+                    try:
+                        self.pygame.mixer.music.stop()
+                    except Exception:
+                        pass
+            return
+
+        with self.process_lock:
+            process = self.current_process
+
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=0.3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+    def _ensure_pygame(self):
+        if self.pygame is not None:
+            return self.pygame
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="pkg_resources is deprecated as an API.*",
+                category=UserWarning,
+            )
+            import pygame
+
+        with self.mixer_lock:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+        self.pygame = pygame
+        return pygame
+
+    def _play_with_pygame(self, audio_path):
+        pygame = self._ensure_pygame()
+        with self.mixer_lock:
+            pygame.mixer.music.load(audio_path)
+            pygame.mixer.music.play()
+
+        clock = pygame.time.Clock()
+        while not self.stop_event.is_set():
+            with self.mixer_lock:
+                is_busy = pygame.mixer.music.get_busy()
+            if not is_busy:
+                break
+            clock.tick(30)
+
+        if self.stop_event.is_set():
+            with self.mixer_lock:
+                pygame.mixer.music.stop()
+
+        with self.mixer_lock:
+            try:
+                pygame.mixer.music.unload()
+            except Exception:
+                pass
+
+    def _play_with_subprocess(self, audio_path):
+        if self.audio_player is None:
+            raise RuntimeError("找不到可用音频播放器")
+
+        process = subprocess.Popen(
+            self.audio_player + [audio_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with self.process_lock:
+            self.current_process = process
+
+        try:
+            while process.poll() is None:
+                if self.stop_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.3)
+                    except Exception:
+                        process.kill()
+                    break
+                time.sleep(0.03)
+        finally:
+            with self.process_lock:
+                if self.current_process is process:
+                    self.current_process = None
+
+    def _play_audio(self, audio_path):
+        if is_windows():
+            self._play_with_pygame(audio_path)
+        else:
+            self._play_with_subprocess(audio_path)
+
+    def _run(self):
+        while True:
+            _text, audio_path = self.message_queue.get()
+            self.busy = True
+            self.stop_event.clear()
+            try:
+                self._play_audio(audio_path)
+            except Exception as exc:
+                print(f"⚠️ 缓存语音播放失败，后续将回退到系统语音：{exc}")
+                self.disabled = True
+            finally:
+                self.busy = False
+                self.stop_event.clear()
+                self.message_queue.task_done()
+
+
+def create_cached_edge_audio_engine():
+    if not tts_engine_uses_cached_edge_audio():
+        return None
+
+    return CachedEdgeAudioEngine()
+
+
 class EdgeTTSEngine:
     """使用 edge-tts 在线神经网络音色，失败时禁用并回退到系统语音。"""
 
@@ -522,11 +781,11 @@ class EdgeTTSEngine:
 
 
 def create_edge_tts_engine():
-    if TTS_ENGINE != "edge":
+    if TTS_ENGINE != "edge_runtime":
         return None
 
     if not edge_tts_is_installed():
-        if TTS_ENGINE == "edge":
+        if TTS_ENGINE == "edge_runtime":
             print("⚠️ 没有安装 edge-tts，将回退到系统语音。")
         return None
 
@@ -643,6 +902,7 @@ def create_melotts_engine():
 
 
 windows_sapi_engine = create_windows_sapi_engine()
+cached_edge_audio_engine = create_cached_edge_audio_engine()
 edge_tts_engine = create_edge_tts_engine()
 melo_tts_engine = create_melotts_engine()
 
@@ -1099,6 +1359,12 @@ def get_stage_group(stage):
 def speak(text, stage, interrupt=False):
     """非阻塞语音播报；没有 TTS 时退化为终端输出。"""
     global voice_process, active_voice_stage
+
+    if cached_edge_audio_engine is not None and not cached_edge_audio_engine.disabled:
+        if cached_edge_audio_engine.speak(text, interrupt=interrupt):
+            print(f"🔊 康复提示：{text}")
+            active_voice_stage = stage
+            return True
 
     if TTS_ENGINE in ("system", "sapi", "windows") and windows_sapi_engine is not None and not windows_sapi_engine.disabled:
         if not windows_sapi_engine.speak(text, interrupt=interrupt):
