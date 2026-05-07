@@ -4,7 +4,7 @@ opencv-contrib-python==4.10.0.84
 numpy==1.26.4
 Pillow==12.2.0
 
-# Windows system speech / COM support for step1_knee_bending_v1_win.py
+# Windows fallback system speech / COM support
 pywin32==311; sys_platform == "win32"
 
 # Cached neural TTS audio generation/playback for feedback prompts
