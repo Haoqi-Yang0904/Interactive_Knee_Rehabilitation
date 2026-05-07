@@ -68,6 +68,8 @@ WINDOW_INITIAL_HEIGHT = int(os.getenv("WINDOW_INITIAL_HEIGHT", "720"))
 OVERLAY_UI_SCALE = float(os.getenv("OVERLAY_UI_SCALE", "0.67"))
 CAPTURE_ROOT_DIRNAME = "test_pose"
 PROGRAM_START_TIMESTAMP = time.time()
+SAPI_SPEAK_ASYNC = 1
+SAPI_PURGE_BEFORE_SPEAK = 2
 
 FEEDBACK_MESSAGES = {
     "far": [
@@ -345,15 +347,35 @@ class WindowsSAPIEngine:
     def is_busy(self):
         return self.busy or not self.message_queue.empty()
 
-    def speak(self, text):
-        if self.disabled or self.is_busy():
+    def _drop_pending_message(self):
+        try:
+            self.message_queue.get_nowait()
+            self.message_queue.task_done()
+            return True
+        except queue.Empty:
             return False
 
+    def clear_pending_messages(self):
+        while self._drop_pending_message():
+            pass
+
+    def speak(self, text, interrupt=False):
+        if self.disabled:
+            return False
+
+        if interrupt:
+            self.clear_pending_messages()
+
         try:
-            self.message_queue.put_nowait(text)
+            self.message_queue.put_nowait((text, interrupt))
             return True
         except queue.Full:
-            return False
+            self._drop_pending_message()
+            try:
+                self.message_queue.put_nowait((text, True))
+                return True
+            except queue.Full:
+                return False
 
     def _select_chinese_voice(self):
         preferred_voice = SAY_VOICE.strip()
@@ -406,11 +428,14 @@ class WindowsSAPIEngine:
 
     def _run(self):
         while True:
-            text = self.message_queue.get()
+            text, interrupt = self.message_queue.get()
             self.busy = True
             try:
                 if self._ensure_speaker():
-                    self.speaker.Speak(text)
+                    flags = SAPI_SPEAK_ASYNC
+                    if interrupt:
+                        flags |= SAPI_PURGE_BEFORE_SPEAK
+                    self.speaker.Speak(text, flags)
             except Exception as exc:
                 print(f"⚠️ Windows SAPI 播报失败，后续只输出文字提示：{exc}")
                 self.disabled = True
@@ -1071,12 +1096,12 @@ def get_stage_group(stage):
     return stage
 
 
-def speak(text, stage):
+def speak(text, stage, interrupt=False):
     """非阻塞语音播报；没有 TTS 时退化为终端输出。"""
     global voice_process, active_voice_stage
 
     if TTS_ENGINE in ("system", "sapi", "windows") and windows_sapi_engine is not None and not windows_sapi_engine.disabled:
-        if not windows_sapi_engine.speak(text):
+        if not windows_sapi_engine.speak(text, interrupt=interrupt):
             return False
 
         print(f"🔊 康复提示：{text}")
@@ -1100,7 +1125,7 @@ def speak(text, stage):
         return True
 
     if windows_sapi_engine is not None and not windows_sapi_engine.disabled:
-        if not windows_sapi_engine.speak(text):
+        if not windows_sapi_engine.speak(text, interrupt=interrupt):
             return False
 
         print(f"🔊 康复提示：{text}")
@@ -1108,7 +1133,10 @@ def speak(text, stage):
         return True
 
     if voice_process is not None and voice_process.poll() is None:
-        return False
+        if not interrupt:
+            return False
+        voice_process.terminate()
+        voice_process = None
 
     print(f"🔊 康复提示：{text}")
     if macos_say_command is None:
@@ -1140,13 +1168,14 @@ def maybe_speak_feedback(stage, current_time, angle=None, target_just_reached=Fa
     if not angle_stable and not entering_target and not view_warning and stage in ("target", "hold"):
         return
 
-    if not entering_target and not view_warning and not stage_group_changed and not cooldown_ready:
+    if not entering_target and not view_warning and not stage_changed and not stage_group_changed and not cooldown_ready:
         return
 
     if view_warning and not (cooldown_ready or stage_changed):
         return
 
-    if speak(next_feedback_message(stage), stage=stage):
+    interrupt_current_voice = entering_target or stage_changed or stage_group_changed
+    if speak(next_feedback_message(stage), stage=stage, interrupt=interrupt_current_voice):
         last_voice_time = current_time
         last_feedback_stage = stage
 
