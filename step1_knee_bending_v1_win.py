@@ -34,7 +34,7 @@ VOICE_COOLDOWN_SECONDS = 7.0
 SAY_RATE = os.getenv("SAY_RATE", "155")
 SAY_VOICE = os.getenv("SAY_VOICE", "")
 WINDOWS_SPEECH_RATE = os.getenv("WINDOWS_SPEECH_RATE", "0")
-TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()
+TTS_ENGINE = os.getenv("TTS_ENGINE", "system").lower()
 EDGE_VOICE = os.getenv("EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 EDGE_RATE = os.getenv("EDGE_RATE", "-10%")
 EDGE_VOLUME = os.getenv("EDGE_VOLUME", "+0%")
@@ -497,7 +497,7 @@ class EdgeTTSEngine:
 
 
 def create_edge_tts_engine():
-    if TTS_ENGINE not in ("auto", "edge"):
+    if TTS_ENGINE != "edge":
         return None
 
     if not edge_tts_is_installed():
@@ -606,7 +606,7 @@ class MeloTTSEngine:
 
 
 def create_melotts_engine():
-    if TTS_ENGINE not in ("auto", "melo"):
+    if TTS_ENGINE != "melo":
         return None
 
     if not melotts_is_installed():
@@ -1075,6 +1075,14 @@ def speak(text, stage):
     """非阻塞语音播报；没有 TTS 时退化为终端输出。"""
     global voice_process, active_voice_stage
 
+    if TTS_ENGINE in ("system", "sapi", "windows") and windows_sapi_engine is not None and not windows_sapi_engine.disabled:
+        if not windows_sapi_engine.speak(text):
+            return False
+
+        print(f"🔊 康复提示：{text}")
+        active_voice_stage = stage
+        return True
+
     if edge_tts_engine is not None and not edge_tts_engine.disabled:
         if not edge_tts_engine.speak(text):
             return False
@@ -1458,6 +1466,37 @@ def save_pose_capture(image, capture_session_dir):
     return image_path
 
 
+def format_angle_timestamp(timestamp=None):
+    if timestamp is None:
+        timestamp = time.time()
+
+    time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+    milliseconds = int((timestamp % 1.0) * 1000)
+    return f"{time_text}.{milliseconds:03d}"
+
+
+def format_angle_log_value(angle):
+    if angle is None:
+        return "NA"
+    return f"{angle:.2f}"
+
+
+def create_angle_log(capture_session_dir):
+    session_label = format_capture_timestamp(PROGRAM_START_TIMESTAMP)
+    log_path = os.path.join(capture_session_dir, f"angle_{session_label}.txt")
+    log_file = open(log_path, "w", encoding="utf-8", newline="")
+    log_file.write("timestamp, angle_2d\n")
+    log_file.flush()
+    return log_file, log_path
+
+
+def write_angle_log(log_file, current_time, angle_2d):
+    log_file.write(
+        f"{format_angle_timestamp(current_time)}, {format_angle_log_value(angle_2d)}\n"
+    )
+    log_file.flush()
+
+
 def get_camera_index_candidates():
     if CAMERA_INDEX is not None:
         try:
@@ -1518,6 +1557,8 @@ cap = open_preferred_camera()
 create_display_window()
 capture_session_dir = create_capture_session_dir()
 print(f"📁 本次截图保存目录：{capture_session_dir}")
+angle_log_file, angle_log_path = create_angle_log(capture_session_dir)
+print(f"📝 2D角度日志：{angle_log_path}")
 
 # 用于自动截图的计时器变量
 last_capture_time = time.time()
@@ -1558,6 +1599,7 @@ with mp_pose.Pose(
         hold_seconds = 0.0
         angle_stable = False
         angle = None
+        angle_2d = None
         knee_image = None
         hip_image = None
         distal_image = None
@@ -1580,22 +1622,12 @@ with mp_pose.Pose(
             if distal_landmark_name is not None:
                 distal_image = get_landmark_xy(landmarks, distal_landmark_name)
 
-            if results.pose_world_landmarks and distal_landmark_name is not None:
-                angle_landmarks = results.pose_world_landmarks.landmark
-                hip = get_landmark_xyz(angle_landmarks, tracked_landmarks["hip"])
-                knee = get_landmark_xyz(angle_landmarks, tracked_landmarks["knee"])
-                distal_point = get_landmark_xyz(angle_landmarks, distal_landmark_name)
-            elif distal_landmark_name is not None:
-                hip = hip_image
-                knee = knee_image
-                distal_point = distal_image
-
             if distal_landmark_name is None or distal_image is None:
                 angle = None
                 view_warning_stage = "low_visibility"
             else:
-                angle = calculate_angle(hip, knee, distal_point)
-                angle = smooth_angle_value(angle)
+                angle_2d = calculate_angle(hip_image, knee_image, distal_image)
+                angle = smooth_angle_value(angle_2d)
                 hip_image = smooth_normalized_point("hip", hip_image)
                 knee_image = smooth_normalized_point("knee", knee_image)
                 distal_image = smooth_normalized_point("distal", distal_image)
@@ -1660,6 +1692,8 @@ with mp_pose.Pose(
             angle_history.clear()
             reset_tracking_filters()
             missing_parts = ["髋部", "膝盖", DISTAL_REFERENCE_LABEL]
+
+        write_angle_log(angle_log_file, current_time, angle_2d)
 
         info_lines = [f"当前监测：{tracked_leg_name}"]
         if angle is not None:
@@ -1820,5 +1854,6 @@ with mp_pose.Pose(
             capture_path = save_pose_capture(image, capture_session_dir)
             print(f"📸 已截取当前姿态并保存为：{capture_path}")
 
+angle_log_file.close()
 cap.release()
 cv2.destroyAllWindows()

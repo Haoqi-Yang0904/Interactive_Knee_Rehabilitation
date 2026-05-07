@@ -1,0 +1,19 @@
+# Core pose-recognition runtime
+mediapipe==0.10.14
+opencv-contrib-python==4.10.0.84
+numpy==1.26.4
+Pillow==12.2.0
+
+# Windows system speech / COM support for step1_knee_bending_v1_win.py
+pywin32==311; sys_platform == "win32"
+
+# Optional online neural TTS backend used when TTS_ENGINE=edge
+edge-tts==7.2.8
+pygame==2.6.1
+
+# VLM prompt demo in step3_VLM_Prompt.py
+requests==2.33.1
+
+# Optional local TTS backend:
+# MeloTTS is intentionally not installed by default because it pulls large
+# ML/audio dependencies. See TTS_SETUP.md if you want TTS_ENGINE=melo.
