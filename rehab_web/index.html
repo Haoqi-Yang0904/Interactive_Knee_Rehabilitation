@@ -30,8 +30,6 @@
   <body>
     <div class="page-shell">
       <div class="page-orb orb-a"></div>
-      <div class="page-orb orb-b"></div>
-      <div class="page-orb orb-c"></div>
 
       <header class="site-header">
         <a class="brand" href="#top">
@@ -42,7 +40,7 @@
           </span>
         </a>
         <nav class="site-nav">
-          <a href="#modules">功能模块</a>
+          <a href="#modules">训练选择</a>
           <a href="#workspace">训练工作台</a>
           <a href="#guide">拍摄说明</a>
         </nav>
@@ -51,48 +49,22 @@
       <main id="top">
         <section class="hero-section">
           <div class="hero-copy">
-            <p class="eyebrow">网页版优先，先把患者真正用起来</p>
-            <h1>把关节康复训练，做成患者打开网页就能直接开始的服务。</h1>
+            <p class="eyebrow">在家训练 · 打开网页就开始</p>
+            <h1>跟着提示做膝关节/肩关节康复训练，动作稳、角度清楚。</h1>
             <p class="hero-text">
-              对你现在这个阶段来说，网页端通常比原生 App 更直接：免安装、更新快、验证成本低，也更适合先把膝关节、肩关节这些核心训练模块做成熟。
+              打开网页并允许摄像头后，系统会实时识别你的动作、显示角度，并用语音提醒是否达标与需要保持的时间。
             </p>
             <div class="hero-actions">
               <a class="button button-primary" href="#workspace" data-module-jump="knee">开始膝关节训练</a>
               <a class="button button-secondary" href="#modules">查看全部模块</a>
             </div>
-            <div class="hero-stats">
-              <article>
-                <strong>Web MVP</strong>
-                <span>低开发成本，患者打开即用</span>
-              </article>
-              <article>
-                <strong>实时检测</strong>
-                <span>浏览器摄像头 + 姿态识别</span>
-              </article>
-              <article>
-                <strong>模块化扩展</strong>
-                <span>后续可继续接肩、踝、髋</span>
-              </article>
-            </div>
           </div>
-
-          <aside class="hero-panel">
-            <div class="hero-panel-card">
-              <span class="panel-kicker">当前建议</span>
-              <h2>先做网站版，更适合你现在的搭建阶段。</h2>
-              <ul>
-                <li>患者不用下载，减少首次使用门槛。</li>
-                <li>你改完算法后，部署一次所有人立刻用新版本。</li>
-                <li>前期能集中验证训练流程，而不是先投入 App 发布和兼容成本。</li>
-              </ul>
-            </div>
-          </aside>
         </section>
 
         <section id="modules" class="module-section">
           <div class="section-heading">
-            <p class="eyebrow">功能模块</p>
-            <h2>患者点击模块，就进入对应训练工作台。</h2>
+            <p class="eyebrow">训练选择</p>
+            <h2>选择训练类型后，按提示完成动作即可。</h2>
           </div>
 
           <div class="module-grid">
@@ -103,8 +75,8 @@
                   <span class="pill pill-active">已可体验</span>
                   <span class="pill">侧面拍摄</span>
                 </div>
-                <h3>膝关节屈曲康复</h3>
-                <p>实时识别髋、膝、踝位置，判断屈膝角度，提示达标与保持时间。</p>
+                <h3>膝关节屈曲训练</h3>
+                <p>实时识别髋、膝、踝位置，显示屈膝角度，并提示达标与保持时间。</p>
               </div>
               <button class="module-action" type="button">进入训练</button>
             </article>
@@ -116,23 +88,10 @@
                   <span class="pill pill-active">已可体验</span>
                   <span class="pill">正面拍摄</span>
                 </div>
-                <h3>肩关节康复训练</h3>
-                <p>支持前屈、外展、中立位外旋、后伸 4 个动作，实时识别角度与动作约束。</p>
+                <h3>肩关节训练</h3>
+                <p>支持前屈、外展、外旋、后伸 4 个动作，实时识别角度并提醒动作方向。</p>
               </div>
               <button class="module-action" type="button">进入训练</button>
-            </article>
-
-            <article class="module-card" data-module="ankle" data-status="coming-soon">
-              <div class="module-icon">踝</div>
-              <div class="module-body">
-                <div class="module-meta">
-                  <span class="pill pill-muted">规划中</span>
-                  <span class="pill">前/侧视切换</span>
-                </div>
-                <h3>踝关节活动训练</h3>
-                <p>可继续扩展背屈、跖屈与康复动作计次，为家庭训练提供统一入口。</p>
-              </div>
-              <button class="module-action module-action-muted" type="button">即将上线</button>
             </article>
           </div>
         </section>
@@ -142,7 +101,7 @@
             <p class="eyebrow">训练工作台</p>
             <h2 id="workspaceTitle">膝关节屈曲康复训练</h2>
             <p id="workspaceSubtitle" class="section-subtitle">
-              患者点击“启动摄像头”后，就能在浏览器里直接进行训练，不需要安装桌面 App。
+              点击“启动摄像头”并允许权限后，就能在浏览器里直接进行训练。
             </p>
           </div>
 
@@ -150,13 +109,22 @@
             <aside class="control-panel">
               <div class="panel-card emphasis-card">
                 <div class="panel-header">
-                  <span class="panel-label">当前模块</span>
+                  <span class="panel-label">当前训练</span>
                   <span id="moduleBadge" class="pill pill-active">膝关节训练</span>
                 </div>
-                <h3>家庭康复模式</h3>
+                <h3>训练说明</h3>
                 <p id="moduleSummary">
-                  目标是帮助患者在侧身拍摄条件下完成屈膝动作，并看到实时角度、达标状态和保持时间。
+                  侧身拍摄完成屈膝动作训练，实时看到角度、达标状态和保持时间。
                 </p>
+                <details class="details" id="guide">
+                  <summary class="details-summary">拍摄要求（点击展开）</summary>
+                  <ul id="guideList" class="check-list">
+                    <li>站成腿部侧面对着镜头，别斜站。</li>
+                    <li>画面最好拍到双肩到脚，至少保证髋、膝、脚踝完整可见。</li>
+                    <li>推荐距离大约 1.8 到 2.4 米，人物占画面高度约 65% 到 80%。</li>
+                    <li>镜头高度放在膝到髋之间，更利于角度判断。</li>
+                  </ul>
+                </details>
               </div>
 
               <div class="panel-card">
@@ -177,6 +145,10 @@
                     <span>动作状态</span>
                     <strong id="stabilityValue">等待开始</strong>
                   </article>
+                  <article class="metric-card metric-card-success">
+                    <span>成功次数</span>
+                    <strong id="completedRepsValue">0 次</strong>
+                  </article>
                 </div>
                 <div class="progress-block">
                   <div class="progress-copy">
@@ -187,6 +159,35 @@
                     <div id="holdProgressBar" class="progress-fill"></div>
                   </div>
                 </div>
+              </div>
+
+              <div class="panel-card demo-card" id="demoPanel" data-demo="knee">
+                <div class="panel-header">
+                  <span class="panel-label">动作示范</span>
+                  <span id="demoBadge" class="pill pill-active">膝关节屈曲</span>
+                </div>
+                <div class="demo-stage" aria-hidden="true">
+                  <svg class="demo-figure" viewBox="0 0 320 220" role="img">
+                    <line class="demo-guide-line" x1="60" y1="178" x2="260" y2="178"></line>
+                    <circle class="demo-head" cx="160" cy="38" r="15"></circle>
+                    <line class="demo-torso" x1="160" y1="55" x2="160" y2="112"></line>
+                    <line class="demo-support-leg" x1="160" y1="112" x2="160" y2="178"></line>
+                    <g class="demo-limb demo-leg">
+                      <line x1="160" y1="112" x2="198" y2="148"></line>
+                      <line class="demo-moving-part" x1="198" y1="148" x2="240" y2="178"></line>
+                    </g>
+                    <g class="demo-limb demo-arm">
+                      <line x1="160" y1="72" x2="196" y2="108"></line>
+                      <line class="demo-moving-part" x1="196" y1="108" x2="232" y2="144"></line>
+                    </g>
+                    <circle class="demo-joint demo-shoulder" cx="160" cy="72" r="7"></circle>
+                    <circle class="demo-joint demo-hip" cx="160" cy="112" r="7"></circle>
+                    <circle class="demo-joint demo-knee" cx="198" cy="148" r="7"></circle>
+                    <circle class="demo-joint demo-wrist" cx="232" cy="144" r="7"></circle>
+                  </svg>
+                </div>
+                <h3 id="demoTitle">侧身屈膝到目标角度</h3>
+                <p id="demoText">身体侧面对着镜头，髋、膝、小腿末端保持清楚可见，慢慢屈膝到目标角度后稳定保持。</p>
               </div>
 
               <div class="panel-card">
@@ -211,21 +212,7 @@
                   <input id="voiceToggle" type="checkbox" checked />
                   <span>开启语音提示</span>
                 </label>
-                <p class="helper-text">
-                  浏览器版默认只在本地设备内处理摄像头画面，不会主动上传视频内容。
-                </p>
-              </div>
-
-              <div id="guide" class="panel-card">
-                <div class="panel-header">
-                  <span class="panel-label">拍摄要求</span>
-                </div>
-                <ul id="guideList" class="check-list">
-                  <li>站成腿部侧面对着镜头，别斜站。</li>
-                  <li>画面最好拍到双肩到脚，至少保证髋、膝、脚踝完整可见。</li>
-                  <li>推荐距离大约 1.8 到 2.4 米，人物占画面高度约 65% 到 80%。</li>
-                  <li>镜头高度放在膝到髋之间，更利于角度判断。</li>
-                </ul>
+                <p class="helper-text">浏览器版仅在本地处理摄像头画面，不会主动上传视频内容。</p>
               </div>
 
               <div class="panel-card status-card">
@@ -234,14 +221,19 @@
                 </div>
                 <h3 id="statusHeadline">准备开始训练</h3>
                 <p id="statusText">
-                  点击“启动摄像头”，允许浏览器访问摄像头后，患者即可开始膝关节康复训练。
+                  点击“启动摄像头”，允许浏览器访问摄像头后即可开始训练。
                 </p>
-                <div class="tip-log">
+                <div class="tip-log is-hidden" id="sessionLogWrapper">
                   <div class="tip-log-header">
                     <span>训练记录</span>
                     <strong id="repCounter">完成次数：0</strong>
                   </div>
                   <ul id="sessionLog"></ul>
+                </div>
+                <div class="button-row">
+                  <button id="toggleLogButton" class="button button-secondary button-ghost" type="button" aria-expanded="false">
+                    展开记录
+                  </button>
                 </div>
               </div>
             </aside>

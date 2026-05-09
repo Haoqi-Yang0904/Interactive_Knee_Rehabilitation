@@ -11,6 +11,14 @@ from pathlib import Path
 WEB_ROOT = Path(__file__).resolve().parent / "rehab_web"
 
 
+class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="启动关节康复网站本地服务")
     parser.add_argument("--port", type=int, default=8000, help="本地端口,默认 8000")
@@ -25,11 +33,11 @@ def main() -> None:
         raise FileNotFoundError(f"找不到网页目录:{WEB_ROOT}")
 
     os.chdir(WEB_ROOT)
-    handler = http.server.SimpleHTTPRequestHandler
+    handler = NoCacheHTTPRequestHandler
     socketserver.ThreadingTCPServer.allow_reuse_address = True
 
     with socketserver.ThreadingTCPServer(("127.0.0.1", args.port), handler) as server:
-        url = f"http://127.0.0.1:{args.port}/"
+        url = f"http://localhost:{args.port}/"
         print(f"康复网站已启动:{url}")
         print("按 Ctrl+C 停止服务.")
         if not args.no_open:

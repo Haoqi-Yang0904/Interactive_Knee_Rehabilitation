@@ -1,5 +1,4 @@
 import cv2
-import mediapipe as mp
 import numpy as np
 import time
 import shutil
@@ -20,11 +19,20 @@ except ImportError:
     ImageDraw = None
     ImageFont = None
 
-# 初始化 MediaPipe 的 Pose 模块
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
+# 初始化 MediaPipe 的 Pose 模块 (兼容新版 mediapipe >= 0.10.30)
+from pose_compat import (
+    Pose as PoseLandmarker,
+    PoseLandmark,
+    POSE_CONNECTIONS,
+    draw_landmarks,
+    DrawingSpec,
+)
+from pose_compat import create_pose_module, DrawingUtils
 
-VOICE_COOLDOWN_SECONDS = 7.0
+mp_pose = create_pose_module()
+mp_drawing = DrawingUtils()
+
+VOICE_COOLDOWN_SECONDS = float(os.getenv("VOICE_COOLDOWN_SECONDS", "12.0"))
 SAY_RATE = os.getenv("SAY_RATE", "155")
 SAY_VOICE = os.getenv("SAY_VOICE", "")
 TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()
@@ -34,6 +42,10 @@ EDGE_VOLUME = os.getenv("EDGE_VOLUME", "+0%")
 MELO_DEVICE = os.getenv("MELO_DEVICE", "auto")
 MELO_SPEED = float(os.getenv("MELO_SPEED", "0.95"))
 MELO_SPEAKER = os.getenv("MELO_SPEAKER", "ZH")
+PROGRAM_START_TIMESTAMP = time.time()
+CAPTURE_ROOT_DIRNAME = "test_pose"
+CAPTURE_SESSION_PREFIX = "shoulder"
+ANGLE_LOG_INTERVAL_SECONDS = float(os.getenv("ANGLE_LOG_INTERVAL_SECONDS", "0.2"))
 
 TRACK_ARM = os.getenv("TRACK_ARM", "auto").lower()
 SHOULDER_EXERCISE = os.getenv("SHOULDER_EXERCISE", "forward_flexion").lower()
@@ -300,6 +312,9 @@ target_reached_time = None
 voice_process = None
 active_voice_stage = None
 angle_history = deque(maxlen=60)
+best_angle = 0.0
+completed_reps = 0
+rep_counted = False
 overlay_font_cache = {}
 current_exercise_key = SHOULDER_EXERCISE
 
@@ -790,10 +805,10 @@ def maybe_speak_feedback(exercise_key, stage, current_time, target_just_reached=
     if not angle_stable and not entering_target and not view_warning and stage in ("target", "hold"):
         return
 
-    if not entering_target and not view_warning and not stage_group_changed and not cooldown_ready:
+    if not entering_target and not cooldown_ready:
         return
 
-    if view_warning and not (cooldown_ready or stage_changed):
+    if view_warning and not cooldown_ready:
         return
 
     if speak(next_feedback_message(exercise_key, stage), stage=stage):
@@ -1552,6 +1567,90 @@ def draw_progress_bar(image, top_left, width, height, progress, fill_color):
     cv2.rectangle(image, (x, y), (x + width, y + height), (255, 255, 255), 2)
 
 
+def format_capture_timestamp(timestamp=None, include_milliseconds=False):
+    if timestamp is None:
+        timestamp = time.time()
+
+    label = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(timestamp))
+    if include_milliseconds:
+        milliseconds = int((timestamp % 1.0) * 1000)
+        label = f"{label}_{milliseconds:03d}"
+    return label
+
+
+def create_capture_session_dir():
+    capture_root = os.path.join(os.getcwd(), CAPTURE_ROOT_DIRNAME)
+    os.makedirs(capture_root, exist_ok=True)
+
+    session_label = format_capture_timestamp(PROGRAM_START_TIMESTAMP)
+    session_name = f"{CAPTURE_SESSION_PREFIX}_{session_label}"
+    session_dir = os.path.join(capture_root, session_name)
+    if not os.path.exists(session_dir):
+        os.makedirs(session_dir)
+        return session_dir
+
+    suffix = 2
+    while True:
+        candidate = os.path.join(capture_root, f"{session_name}_{suffix}")
+        if not os.path.exists(candidate):
+            os.makedirs(candidate)
+            return candidate
+        suffix += 1
+
+
+def save_pose_capture(image, capture_session_dir):
+    timestamp_label = format_capture_timestamp(include_milliseconds=True)
+    filename = f"{CAPTURE_SESSION_PREFIX}_pose_{timestamp_label}.jpg"
+    image_path = os.path.join(capture_session_dir, filename)
+
+    suffix = 2
+    while os.path.exists(image_path):
+        filename = f"{CAPTURE_SESSION_PREFIX}_pose_{timestamp_label}_{suffix}.jpg"
+        image_path = os.path.join(capture_session_dir, filename)
+        suffix += 1
+
+    cv2.imwrite(image_path, image)
+    return image_path
+
+
+def format_angle_timestamp(timestamp=None):
+    if timestamp is None:
+        timestamp = time.time()
+
+    time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+    milliseconds = int((timestamp % 1.0) * 1000)
+    return f"{time_text}.{milliseconds:03d}"
+
+
+def format_angle_log_value(angle):
+    if angle is None:
+        return "NA"
+    return f"{angle:.2f}"
+
+
+def create_angle_log(capture_session_dir):
+    session_label = format_capture_timestamp(PROGRAM_START_TIMESTAMP)
+    log_path = os.path.join(
+        capture_session_dir,
+        f"angle_{CAPTURE_SESSION_PREFIX}_{session_label}.txt",
+    )
+    log_file = open(log_path, "w", encoding="utf-8", newline="")
+    log_file.write("timestamp, primary_angle, evaluation_angle, stage\n")
+    log_file.flush()
+    return log_file, log_path
+
+
+def write_angle_log(log_file, current_time, primary_angle, evaluation_angle, stage):
+    stage_text = stage or "NA"
+    log_file.write(
+        f"{format_angle_timestamp(current_time)}, "
+        f"{format_angle_log_value(primary_angle)}, "
+        f"{format_angle_log_value(evaluation_angle)}, "
+        f"{stage_text}\n"
+    )
+    log_file.flush()
+
+
 def get_camera_index_candidates():
     if CAMERA_INDEX is not None:
         try:
@@ -1622,11 +1721,24 @@ print("肩关节康复多动作模式已启动。")
 print("按键说明：1-前屈  2-外展  3-外旋  4-后伸  |  s-截图  q-退出")
 
 # 打开电脑主摄像头
-cap = open_preferred_camera()
+try:
+    cap = open_preferred_camera()
+except RuntimeError as exc:
+    print(f"❌ {exc}")
+    print("提示: 请确认摄像头未被占用，或通过 CAMERA_INDEX 指定设备索引。")
+    if sys.platform == "darwin":
+        print("macOS 提示: 请在 系统设置 → 隐私与安全性 → 摄像头 中勾选终端/VS Code/Python 的权限后重试。")
+    sys.exit(1)
+
+capture_session_dir = create_capture_session_dir()
+print(f"📁 本次截图保存目录：{capture_session_dir}")
+angle_log_file, angle_log_path = create_angle_log(capture_session_dir)
+print(f"📝 角度日志：{angle_log_path}")
 
 # 用于自动截图的计时器变量
 last_capture_time = time.time()
 capture_interval = 5.0  # 每 5 秒自动截取一张照片
+last_log_time = 0.0
 
 # 开启姿态估计实例
 with mp_pose.Pose(
@@ -1730,6 +1842,15 @@ with mp_pose.Pose(
                     angle_stable=angle_stable,
                 )
 
+                if feedback_stage == "rest" and not rep_counted:
+                    completed_reps += 1
+                    rep_counted = True
+                if feedback_stage != "rest" and evaluation_angle < analysis["target_angle"] - 8:
+                    rep_counted = False
+
+            if analysis["evaluation_angle"] > best_angle:
+                best_angle = analysis["evaluation_angle"]
+
             if analysis["shoulder_image"] is not None and analysis["elbow_image"] is not None and analysis["wrist_image"] is not None:
                 arm_color = (80, 180, 255)
                 if feedback_stage in ("target", "hold", "rest"):
@@ -1759,6 +1880,19 @@ with mp_pose.Pose(
                 )
         else:
             reset_motion_tracking()
+
+        if current_time - last_log_time >= ANGLE_LOG_INTERVAL_SECONDS:
+            if analysis is None:
+                write_angle_log(angle_log_file, current_time, None, None, None)
+            else:
+                write_angle_log(
+                    angle_log_file,
+                    current_time,
+                    analysis["primary_angle"],
+                    analysis["evaluation_angle"],
+                    feedback_stage,
+                )
+            last_log_time = current_time
 
         if analysis is None:
             info_lines = [
@@ -1846,8 +1980,9 @@ with mp_pose.Pose(
             )
 
         if time_elapsed >= capture_interval:
+            capture_path = save_pose_capture(image, capture_session_dir)
             cv2.imwrite("test_shoulder_pose.jpg", image)
-            print("📸 [全自动] 已截取最新肩关节训练姿态，并保存为 'test_shoulder_pose.jpg'。")
+            print(f"📸 [全自动] 已保存最新肩关节训练姿态：{capture_path}")
             overlay = image.copy()
             cv2.rectangle(overlay, (0, 0), (image.shape[1], image.shape[0]), (255, 255, 255), -1)
             image = cv2.addWeighted(overlay, 0.3, image, 0.7, 0)
@@ -1861,10 +1996,13 @@ with mp_pose.Pose(
         if key == ord("q"):
             break
         if key == ord("s"):
+            capture_path = save_pose_capture(image, capture_session_dir)
             cv2.imwrite("test_shoulder_pose.jpg", image)
-            print("📸 已截取当前肩关节训练姿态，并保存为 'test_shoulder_pose.jpg'。")
+            print(f"📸 已截取当前肩关节训练姿态：{capture_path}")
         elif key in ACTION_KEY_BINDINGS:
             switch_exercise(ACTION_KEY_BINDINGS[key])
 
+angle_log_file.close()
+print(f"✅ 训练结束：最佳角度 {int(round(best_angle))}°，完成次数 {completed_reps} 次")
 cap.release()
 cv2.destroyAllWindows()

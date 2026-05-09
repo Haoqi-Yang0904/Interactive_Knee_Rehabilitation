@@ -1,5 +1,4 @@
 import cv2
-import mediapipe as mp
 import numpy as np
 import time
 import shutil
@@ -25,13 +24,22 @@ except ImportError:
     ImageDraw = None
     ImageFont = None
 
-# 初始化 MediaPipe 的 Pose 模块
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
+# 初始化 MediaPipe 的 Pose 模块 (兼容新版 mediapipe >= 0.10.30)
+from pose_compat import (
+    Pose as PoseLandmarker,
+    PoseLandmark,
+    POSE_CONNECTIONS,
+    draw_landmarks,
+    DrawingSpec,
+)
+from pose_compat import create_pose_module, DrawingUtils
+
+mp_pose = create_pose_module()
+mp_drawing = DrawingUtils()
 
 # 膝关节康复目标：屈膝达到 120 度后开始鼓励保持
 TARGET_KNEE_FLEXION_ANGLE = 120.0
-VOICE_COOLDOWN_SECONDS = 7.0
+VOICE_COOLDOWN_SECONDS = float(os.getenv("VOICE_COOLDOWN_SECONDS", "12.0"))
 SAY_RATE = os.getenv("SAY_RATE", "155")
 SAY_VOICE = os.getenv("SAY_VOICE", "")
 WINDOWS_SPEECH_RATE = os.getenv("WINDOWS_SPEECH_RATE", "0")
@@ -61,6 +69,7 @@ DISTAL_LOCK_BONUS = float(os.getenv("DISTAL_LOCK_BONUS", "0.18"))
 POINT_SMOOTHING_ALPHA = float(os.getenv("POINT_SMOOTHING_ALPHA", "0.35"))
 POINT_SMOOTHING_MAX_STEP = float(os.getenv("POINT_SMOOTHING_MAX_STEP", "0.045"))
 ANGLE_SMOOTHING_ALPHA = float(os.getenv("ANGLE_SMOOTHING_ALPHA", "0.30"))
+ANGLE_LOG_INTERVAL_SECONDS = float(os.getenv("ANGLE_LOG_INTERVAL_SECONDS", "0.2"))
 CAMERA_INDEX = os.getenv("CAMERA_INDEX")
 CAMERA_MAX_PROBE_INDEX = int(os.getenv("CAMERA_MAX_PROBE_INDEX", "5"))
 PREFER_MAC_BUILTIN_CAMERA = os.getenv("PREFER_MAC_BUILTIN_CAMERA", "1") == "1"
@@ -127,6 +136,9 @@ target_reached_time = None
 voice_process = None
 active_voice_stage = None
 angle_history = deque(maxlen=60)
+best_angle = 0.0
+completed_reps = 0
+rep_counted = False
 overlay_font_cache = {}
 pygame_playback_lock = threading.Lock()
 
@@ -1434,13 +1446,13 @@ def maybe_speak_feedback(stage, current_time, angle=None, target_just_reached=Fa
     if not angle_stable and not entering_target and not view_warning and stage in ("target", "hold"):
         return
 
-    if not entering_target and not view_warning and not stage_changed and not stage_group_changed and not cooldown_ready:
+    if not entering_target and not cooldown_ready:
         return
 
-    if view_warning and not (cooldown_ready or stage_changed):
+    if view_warning and not cooldown_ready:
         return
 
-    interrupt_current_voice = entering_target or stage_changed or stage_group_changed
+    interrupt_current_voice = False
     if speak(next_feedback_message(stage), stage=stage, interrupt=interrupt_current_voice):
         last_voice_time = current_time
         last_feedback_stage = stage
@@ -1848,7 +1860,14 @@ def open_preferred_camera():
 
 
 # 打开电脑主摄像头
-cap = open_preferred_camera()
+try:
+    cap = open_preferred_camera()
+except RuntimeError as exc:
+    print(f"❌ {exc}")
+    print("提示: 请确认摄像头未被占用，或通过 CAMERA_INDEX 指定设备索引。")
+    if sys.platform == "darwin":
+        print("macOS 提示: 请在 系统设置 → 隐私与安全性 → 摄像头 中勾选终端/VS Code/Python 的权限后重试。")
+    sys.exit(1)
 create_display_window()
 capture_session_dir = create_capture_session_dir()
 print(f"📁 本次截图保存目录：{capture_session_dir}")
@@ -1858,6 +1877,7 @@ print(f"📝 2D角度日志：{angle_log_path}")
 # 用于自动截图的计时器变量
 last_capture_time = time.time()
 capture_interval = 5.0  # 每 5 秒自动截取一张照片
+last_log_time = 0.0
 
 # 开启姿态估计实例
 with mp_pose.Pose(
@@ -1955,6 +1975,14 @@ with mp_pose.Pose(
                     angle_stable=angle_stable,
                 )
 
+                if angle > best_angle:
+                    best_angle = angle
+                if feedback_stage == "rest" and not rep_counted:
+                    completed_reps += 1
+                    rep_counted = True
+                if feedback_stage != "rest" and angle < TARGET_KNEE_FLEXION_ANGLE - 8:
+                    rep_counted = False
+
                 if angle < TARGET_KNEE_FLEXION_ANGLE:
                     guidance_text = draw_knee_guidance(
                         image,
@@ -1988,7 +2016,9 @@ with mp_pose.Pose(
             reset_tracking_filters()
             missing_parts = ["髋部", "膝盖", DISTAL_REFERENCE_LABEL]
 
-        write_angle_log(angle_log_file, current_time, angle_2d)
+        if current_time - last_log_time >= ANGLE_LOG_INTERVAL_SECONDS:
+            write_angle_log(angle_log_file, current_time, angle_2d)
+            last_log_time = current_time
 
         info_lines = [f"当前监测：{tracked_leg_name}"]
         if angle is not None:
@@ -2150,5 +2180,6 @@ with mp_pose.Pose(
             print(f"📸 已截取当前姿态并保存为：{capture_path}")
 
 angle_log_file.close()
+print(f"✅ 训练结束：最佳角度 {int(round(best_angle))}°，完成次数 {completed_reps} 次")
 cap.release()
 cv2.destroyAllWindows()

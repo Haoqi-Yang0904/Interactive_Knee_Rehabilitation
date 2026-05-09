@@ -34,7 +34,8 @@ const CONFIG = {
   pointSmoothingAlpha: 0.35,
   pointSmoothingMaxStep: 0.045,
   angleSmoothingAlpha: 0.3,
-  voiceCooldownMs: 7000,
+  voiceCooldownMs: 12000,
+  showCanvasStatusOverlay: false,
   preferredVideoWidth: 1280,
   preferredVideoHeight: 720,
 };
@@ -135,7 +136,7 @@ const SHOULDER_EXERCISES = {
     name: "中立位外旋",
     shortName: "外旋",
     view: "front",
-    targetAngle: 30,
+    targetAngle: 45,
     holdGoalSeconds: SHOULDER_CONFIG.holdGoalSeconds,
     primaryLabel: "外旋角度",
     startPrompt: "肩关节外旋训练已经开始，请正面对着镜头，大臂贴身，肘关节大约九十度。",
@@ -146,7 +147,7 @@ const SHOULDER_EXERCISES = {
       "正面对着镜头站，双肩摆正，不要侧身。",
       "大臂贴住身体，肘关节弯成大约 90°。",
       "以前臂为主向身体外侧打开，不要整只手臂一起抬起。",
-      "如果 45° 太难，这里先以 30° 作为网页默认目标更贴近家庭训练。",
+      "默认目标角度为 45°，如有不适可先降低角度再逐步增加。",
     ],
   },
   extension: {
@@ -176,6 +177,39 @@ const SHOULDER_EXERCISE_ORDER = [
   "extension",
 ];
 
+const DEMO_CONTENT = {
+  knee: {
+    badge: "膝关节屈曲",
+    title: "侧身屈膝到目标角度",
+    text: "身体侧面对着镜头，髋、膝、小腿末端保持清楚可见，慢慢屈膝到目标角度后稳定保持。",
+    demo: "knee",
+  },
+  forward_flexion: {
+    badge: "肩前屈",
+    title: "手臂从身体前方向上抬",
+    text: "侧身站稳，手臂伸直，从身体前方慢慢向上抬，到目标角度后保持躯干稳定。",
+    demo: "shoulder-forward",
+  },
+  abduction: {
+    badge: "肩外展",
+    title: "手臂从身体侧方向上抬",
+    text: "正面对着镜头，双肩摆平，手臂伸直沿身体侧方向上抬，避免身体歪斜代偿。",
+    demo: "shoulder-abduction",
+  },
+  external_rotation: {
+    badge: "肩外旋",
+    title: "大臂贴身，前臂向外打开",
+    text: "正面对着镜头，大臂贴住身体，肘关节约九十度，只让前臂慢慢向外旋开。",
+    demo: "shoulder-rotation",
+  },
+  extension: {
+    badge: "肩后伸",
+    title: "手臂沿身体一侧向后带",
+    text: "侧身站稳，手臂伸直，沿身体侧面慢慢向身后带，注意躯干不要前倾。",
+    demo: "shoulder-extension",
+  },
+};
+
 const TRACKED_LEG_LANDMARKS = {
   left: {
     hip: LANDMARK.LEFT_HIP,
@@ -195,6 +229,12 @@ const TRACKED_LEG_LANDMARKS = {
       ["foot_index", LANDMARK.RIGHT_FOOT_INDEX],
     ],
   },
+};
+
+const LEG_PART_LABELS = {
+  hip: "髋部",
+  knee: "膝盖",
+  distal: "小腿末端",
 };
 
 const TRACKED_ARM_LANDMARKS = {
@@ -227,6 +267,7 @@ const state = {
   processingFrame: false,
   cameraStarted: false,
   voicesReady: false,
+  voiceActive: false,
   lastVoiceTime: 0,
   lastFeedbackStage: null,
   targetReachedAt: null,
@@ -266,6 +307,7 @@ const elements = {
   targetValue: document.getElementById("targetValue"),
   holdValue: document.getElementById("holdValue"),
   stabilityValue: document.getElementById("stabilityValue"),
+  completedRepsValue: document.getElementById("completedRepsValue"),
   holdProgressBar: document.getElementById("holdProgressBar"),
   progressCaption: document.getElementById("progressCaption"),
   cameraSelect: document.getElementById("cameraSelect"),
@@ -277,7 +319,13 @@ const elements = {
   statusText: document.getElementById("statusText"),
   repCounter: document.getElementById("repCounter"),
   sessionLog: document.getElementById("sessionLog"),
+  sessionLogWrapper: document.getElementById("sessionLogWrapper"),
+  toggleLogButton: document.getElementById("toggleLogButton"),
   guideList: document.getElementById("guideList"),
+  demoPanel: document.getElementById("demoPanel"),
+  demoBadge: document.getElementById("demoBadge"),
+  demoTitle: document.getElementById("demoTitle"),
+  demoText: document.getElementById("demoText"),
   cameraState: document.getElementById("cameraState"),
   trackingState: document.getElementById("trackingState"),
   bestAngleValue: document.getElementById("bestAngleValue"),
@@ -298,7 +346,7 @@ document.addEventListener("DOMContentLoaded", () => {
   bindControls();
   refreshCameraDevices();
   updateModuleUI("knee");
-  pushSessionLog("网页训练工作台已就绪，可以先从膝关节训练开始。");
+  pushSessionLog("训练工作台已就绪，可以先从膝关节训练开始。");
 });
 
 function bindModuleCards() {
@@ -308,9 +356,9 @@ function bindModuleCards() {
       const status = card.dataset.status;
       if (status !== "active") {
         setStatus(
-          "模块正在规划中",
-          `${getModuleDisplayName(moduleKey)}模块已预留入口，后面你可以继续接入对应角度检测。`,
-          "规划中"
+          "该训练模块正在准备",
+          `${getModuleDisplayName(moduleKey)}模块还在准备中，可以先体验其他训练。`,
+          "准备中"
         );
         document.getElementById("workspace").scrollIntoView({ behavior: "smooth", block: "start" });
         return;
@@ -332,6 +380,9 @@ function bindControls() {
   elements.refreshDevicesButton.addEventListener("click", refreshCameraDevices);
   elements.startButton.addEventListener("click", startCurrentTraining);
   elements.stopButton.addEventListener("click", stopTraining);
+  if (elements.toggleLogButton && elements.sessionLogWrapper) {
+    elements.toggleLogButton.addEventListener("click", toggleSessionLog);
+  }
   elements.cameraSelect.addEventListener("change", (event) => {
     state.selectedCameraId = event.target.value;
   });
@@ -350,6 +401,19 @@ function bindControls() {
   });
 }
 
+function toggleSessionLog() {
+  const wrapper = elements.sessionLogWrapper;
+  if (!wrapper) {
+    return;
+  }
+
+  const isHidden = wrapper.classList.toggle("is-hidden");
+  if (elements.toggleLogButton) {
+    elements.toggleLogButton.textContent = isHidden ? "展开记录" : "收起记录";
+    elements.toggleLogButton.setAttribute("aria-expanded", String(!isHidden));
+  }
+}
+
 function updateModuleUI(moduleKey) {
   state.currentModule = moduleKey;
   const activeCards = document.querySelectorAll('.module-card[data-status="active"]');
@@ -360,18 +424,19 @@ function updateModuleUI(moduleKey) {
   if (!state.cameraStarted) {
     state.bestAngle = 0;
     state.completedReps = 0;
-    elements.repCounter.textContent = "完成次数：0";
+    updateSuccessCount();
     setMetricDefaults();
   }
 
   if (moduleKey === "knee") {
+    updateDemoPanel("knee");
     elements.shoulderExerciseField.classList.add("is-hidden");
     elements.workspaceTitle.textContent = "膝关节屈曲康复训练";
     elements.workspaceSubtitle.textContent =
-      "患者打开网页后点击模块即可开始训练，系统会在浏览器里实时计算屈膝角度与保持时间。";
+      "点击“启动摄像头”后即可开始训练，系统会实时计算屈膝角度与保持时间。";
     elements.moduleBadge.textContent = "膝关节训练";
     elements.moduleSummary.textContent =
-      "当前版本采用浏览器摄像头实时识别髋、膝、踝关键点，帮助患者完成屈膝动作训练。";
+      "系统会识别髋、膝、踝关键点，显示角度并提示保持时间。";
     elements.targetValue.textContent = `${CONFIG.targetAngle}°`;
     elements.cameraMaskTitle.textContent = "请将身体侧身放入取景框";
     elements.recognitionModeValue.textContent = "膝关节 · 单人实时训练";
@@ -382,8 +447,8 @@ function updateModuleUI(moduleKey) {
       "镜头高度放在膝到髋之间，更利于角度判断。",
     ]);
     setStatus(
-      "膝关节模块已选中",
-      "可以先调整拍摄位置，再点击“启动摄像头”开始训练。",
+      "膝关节训练已选中",
+      "先调整拍摄位置，再点击“启动摄像头”开始训练。",
       "等待训练"
     );
     return;
@@ -391,14 +456,15 @@ function updateModuleUI(moduleKey) {
 
   if (moduleKey === "shoulder") {
     const profile = getCurrentShoulderExerciseProfile();
+    updateDemoPanel(state.currentShoulderExercise);
     elements.shoulderExerciseField.classList.remove("is-hidden");
     elements.shoulderExerciseSelect.value = state.currentShoulderExercise;
     elements.workspaceTitle.textContent = "肩关节康复训练";
     elements.workspaceSubtitle.textContent =
-      "网页端已经接入肩关节多动作训练，患者可直接在浏览器里选择前屈、外展、外旋、后伸并开始训练。";
+      "可选择前屈、外展、外旋或后伸动作，按提示完成训练。";
     elements.moduleBadge.textContent = "肩关节训练";
     elements.moduleSummary.textContent =
-      `当前选择：${profile.name}。系统会实时计算角度，并检查肘伸直、大臂贴身、动作平面和达标保持时间。`;
+      `当前选择：${profile.name}。系统会提醒动作方向、手臂姿势与保持时间。`;
     elements.targetValue.textContent = `${profile.targetAngle}°`;
     elements.cameraMaskTitle.textContent = profile.cameraMaskTitle;
     elements.recognitionModeValue.textContent = `肩关节 · ${profile.shortName} · 单人实时训练`;
@@ -431,6 +497,14 @@ function renderGuideItems(items) {
   });
 }
 
+function updateDemoPanel(demoKey) {
+  const content = DEMO_CONTENT[demoKey] || DEMO_CONTENT.knee;
+  elements.demoPanel.dataset.demo = content.demo;
+  elements.demoBadge.textContent = content.badge;
+  elements.demoTitle.textContent = content.title;
+  elements.demoText.textContent = content.text;
+}
+
 function getCurrentShoulderExerciseProfile() {
   return SHOULDER_EXERCISES[state.currentShoulderExercise] || SHOULDER_EXERCISES.forward_flexion;
 }
@@ -454,6 +528,48 @@ function getModuleDisplayName(moduleKey) {
   );
 }
 
+function describeCameraError(error) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return {
+      headline: "当前浏览器无法使用摄像头",
+      detail: "请使用最新版 Chrome / Edge / Safari，并通过 http://localhost:8000 访问。",
+      log: "浏览器不支持摄像头接口或未在安全上下文中访问。",
+    };
+  }
+
+  const name = error?.name || "";
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return {
+      headline: "未获得摄像头权限",
+      detail:
+        "请在浏览器地址栏允许摄像头权限，然后再点击“启动摄像头”。若仍失败，请改用 http://localhost:8000 并刷新页面。",
+      log: "摄像头权限被拒绝，请在浏览器设置中开启权限或改用 localhost 访问。",
+    };
+  }
+
+  if (name === "NotFoundError" || name === "OverconstrainedError") {
+    return {
+      headline: "未检测到可用摄像头",
+      detail: "请确认设备有摄像头，或在上方选择其他摄像头后再试。",
+      log: "未检测到可用摄像头或设备选择不匹配。",
+    };
+  }
+
+  if (name === "NotReadableError") {
+    return {
+      headline: "摄像头正在被占用",
+      detail: "请关闭其他正在使用摄像头的应用（如会议软件），然后再试。",
+      log: "摄像头被占用，请关闭其他应用后重试。",
+    };
+  }
+
+  return {
+    headline: "摄像头启动失败",
+    detail: "请确认已允许浏览器访问摄像头，或者切换一个可用的摄像头设备。",
+    log: `摄像头启动失败：${error?.message || "未知错误"}`,
+  };
+}
+
 async function refreshCameraDevices() {
   if (!navigator.mediaDevices?.enumerateDevices) {
     setStatus("当前浏览器不支持设备枚举", "请换用新版 Chrome、Edge 或 Safari。", "浏览器不支持");
@@ -470,6 +586,7 @@ async function refreshCameraDevices() {
       option.value = "";
       option.textContent = "未检测到摄像头";
       elements.cameraSelect.appendChild(option);
+      setStatus("未检测到摄像头", "请检查设备或浏览器权限，然后重新刷新设备。", "设备不可用");
       return;
     }
 
@@ -550,7 +667,7 @@ function resetTrainingSession(clearLog = true) {
 
   elements.bestAngleValue.textContent = "0°";
   elements.feedbackStageValue.textContent = "等待识别";
-  elements.repCounter.textContent = "完成次数：0";
+  updateSuccessCount();
   setMetricDefaults();
   if (clearLog) {
     clearSessionLog();
@@ -559,6 +676,27 @@ function resetTrainingSession(clearLog = true) {
 
 async function startCurrentTraining() {
   try {
+    elements.cameraState.textContent = "摄像头启动中";
+    elements.trackingState.textContent = "申请权限";
+    setStatus(
+      "正在启动摄像头",
+      "浏览器可能会弹出权限提示，请选择允许。",
+      "启动中"
+    );
+    pushSessionLog("正在启动摄像头，请允许权限提示。");
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus(
+        "当前浏览器无法使用摄像头",
+        "请使用最新版 Chrome / Edge / Safari，并通过 http://localhost:8000 访问。",
+        "不支持"
+      );
+      elements.cameraState.textContent = "摄像头不可用";
+      elements.trackingState.textContent = "浏览器不支持";
+      pushSessionLog("浏览器不支持摄像头接口，请更换浏览器或使用 localhost 访问。");
+      return;
+    }
+
     const pose = await ensurePoseModel();
     await stopStreamOnly();
 
@@ -580,12 +718,23 @@ async function startCurrentTraining() {
     try {
       stream = await navigator.mediaDevices.getUserMedia(constraints);
     } catch (error) {
+      const fallbackConstraints = {
+        audio: false,
+        video: {
+          width: { ideal: CONFIG.preferredVideoWidth },
+          height: { ideal: CONFIG.preferredVideoHeight },
+          facingMode: "user",
+        },
+      };
+
       if (constraints.video.deviceId) {
-        delete constraints.video.deviceId;
-        constraints.video.facingMode = "user";
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-      } else {
-        throw error;
+        delete fallbackConstraints.video.deviceId;
+      }
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(fallbackConstraints);
+      } catch (fallbackError) {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       }
     }
 
@@ -621,11 +770,15 @@ async function startCurrentTraining() {
     renderLoop(pose);
   } catch (error) {
     console.error(error);
+    const errorHint = describeCameraError(error);
     setStatus(
-      "摄像头启动失败",
-      "请确认已允许浏览器访问摄像头，或者切换一个可用的摄像头设备。",
+      errorHint.headline,
+      errorHint.detail,
       "启动失败"
     );
+    elements.cameraState.textContent = "摄像头启动失败";
+    elements.trackingState.textContent = "无法启动";
+    pushSessionLog(errorHint.log);
   }
 }
 
@@ -668,6 +821,15 @@ async function stopTraining() {
   setMetricDefaults();
   setStatus("训练已停止", "可以重新调整站位后再次启动摄像头。", "已停止");
   pushSessionLog("训练已停止。");
+  const sessionName =
+    state.currentModule === "shoulder"
+      ? getCurrentShoulderExerciseProfile().name
+      : "膝关节屈曲训练";
+  if (state.bestAngle > 0 || state.completedReps > 0) {
+    pushSessionLog(
+      `训练总结：${sessionName}，最佳角度 ${Math.round(state.bestAngle)}°，完成次数 ${state.completedReps}。`
+    );
+  }
 }
 
 async function stopStreamOnly() {
@@ -687,6 +849,7 @@ function setMetricDefaults() {
   elements.progressCaption.textContent = "还未达到目标角度";
   elements.holdProgressBar.style.width = "0%";
   elements.bestAngleValue.textContent = `${Math.round(state.bestAngle)}°`;
+  updateSuccessCount();
 }
 
 function clearCanvas() {
@@ -733,9 +896,10 @@ function onPoseResults(results) {
   }
 
   const imageLandmarks = results.poseLandmarks;
-  const worldLandmarks = results.poseWorldLandmarks || imageLandmarks;
   const trackedLeg = chooseTrackedLeg(imageLandmarks);
   const viewWarning = getViewWarningStage(imageLandmarks, trackedLeg);
+  const missingParts = getMissingLegParts(imageLandmarks, trackedLeg);
+  const missingText = missingParts.length ? missingParts.join("、") : "髋部、膝盖、小腿末端";
   const [distalPartName, distalIndex] = chooseTrackedDistalLandmark(
     imageLandmarks,
     trackedLeg,
@@ -752,25 +916,21 @@ function onPoseResults(results) {
     elements.trackingState.textContent = "关键点不足";
     setStatus(
       "腿部关键点不完整",
-      "请调整站位，让髋、膝、脚踝都清楚地出现在画面里。",
+      `请调整站位，让${missingText}清楚地出现在画面里。`,
       "关键点不足"
     );
     drawStatusOverlay({
       tone: "warning",
       headline: "关键点还不完整",
-      detail: "请把髋、膝、脚踝露出来，最好双肩到脚都在镜头里。",
+      detail: `请把${missingText}露出来，最好双肩到脚都在镜头里。`,
       footer: "系统暂时无法稳定计算屈膝角度",
     });
-    maybeSpeak("low_visibility", "请把髋、膝、脚踝露出来，最好双肩到脚都在镜头里。");
+    maybeSpeak("low_visibility", `请把${missingText}露出来，最好双肩到脚都在镜头里。`);
     updateMetrics(null);
     return;
   }
 
-  const hipWorld = getLandmarkXYZ(worldLandmarks, hipIndex);
-  const kneeWorld = getLandmarkXYZ(worldLandmarks, kneeIndex);
-  const distalWorld = getLandmarkXYZ(worldLandmarks, distalIndex);
-
-  let angle = calculateExtensionAngle(hipWorld, kneeWorld, distalWorld);
+  let angle = calculateExtensionAngle(hipImage, kneeImage, distalImage);
   angle = smoothAngle(angle);
 
   const smoothedHip = smoothPoint("hip", hipImage);
@@ -791,7 +951,7 @@ function onPoseResults(results) {
     detailText =
       viewWarning === "adjust_view"
         ? "身体不要斜着站，请尽量让腿部侧面与摄像头平行。"
-        : "请把双肩到脚放进镜头里，尤其是髋、膝和脚踝。";
+        : `请把双肩到脚放进镜头里，尤其是${missingText}。`;
   } else {
     updateAngleHistory(angle);
     stable = isAngleStable();
@@ -810,6 +970,7 @@ function onPoseResults(results) {
     if (stage === "rest" && !state.repCounted) {
       state.completedReps += 1;
       state.repCounted = true;
+      updateSuccessCount();
       pushSessionLog(`完成 1 次达标保持训练，最佳角度 ${Math.round(state.bestAngle)}°。`);
     }
     if (stage !== "rest" && angle < CONFIG.targetAngle - 8) {
@@ -945,6 +1106,7 @@ function onShoulderPoseResults(results) {
     if (stage === "rest" && !state.repCounted) {
       state.completedReps += 1;
       state.repCounted = true;
+      updateSuccessCount();
       pushSessionLog(
         `完成 1 次${analysis.profile.shortName}达标保持训练，最佳角度 ${Math.round(state.bestAngle)}°。`
       );
@@ -1214,7 +1376,11 @@ function speakText(text, { force = false, stageKey = "manual" } = {}) {
   }
 
   const now = Date.now();
-  if (!force && state.lastFeedbackStage === stageKey && now - state.lastVoiceTime < CONFIG.voiceCooldownMs) {
+  if (state.voiceActive || window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+    return;
+  }
+
+  if (!force && now - state.lastVoiceTime < CONFIG.voiceCooldownMs) {
     return;
   }
 
@@ -1222,10 +1388,16 @@ function speakText(text, { force = false, stageKey = "manual" } = {}) {
     return;
   }
 
-  window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = "zh-CN";
-  utterance.rate = 1;
+  utterance.rate = 0.95;
+  utterance.onend = () => {
+    state.voiceActive = false;
+  };
+  utterance.onerror = () => {
+    state.voiceActive = false;
+  };
+  state.voiceActive = true;
   window.speechSynthesis.speak(utterance);
   state.lastVoiceTime = now;
   state.lastFeedbackStage = stageKey;
@@ -1245,7 +1417,7 @@ function updateMetrics(payload) {
     elements.progressCaption.textContent = "等待重新识别动作";
     elements.holdProgressBar.style.width = "0%";
     elements.bestAngleValue.textContent = `${Math.round(state.bestAngle)}°`;
-    elements.repCounter.textContent = `完成次数：${state.completedReps}`;
+    updateSuccessCount();
     return;
   }
 
@@ -1265,7 +1437,7 @@ function updateMetrics(payload) {
         : "变化中";
   elements.holdProgressBar.style.width = `${holdRatio * 100}%`;
   elements.bestAngleValue.textContent = `${Math.round(state.bestAngle)}°`;
-  elements.repCounter.textContent = `完成次数：${state.completedReps}`;
+  updateSuccessCount();
 
   if (payload.stage === "hold" || payload.stage === "rest" || payload.stage === "target") {
     elements.progressCaption.textContent =
@@ -1275,6 +1447,13 @@ function updateMetrics(payload) {
   } else {
     const gap = Math.max(0, targetAngle - payload.angle);
     elements.progressCaption.textContent = `距离目标还差 ${gap.toFixed(0)}°`;
+  }
+}
+
+function updateSuccessCount() {
+  elements.repCounter.textContent = `完成次数：${state.completedReps}`;
+  if (elements.completedRepsValue) {
+    elements.completedRepsValue.textContent = `${state.completedReps} 次`;
   }
 }
 
@@ -1297,6 +1476,10 @@ function stageTone(stage) {
 }
 
 function drawStatusOverlay({ tone = "info", headline, detail, footer }) {
+  if (!CONFIG.showCanvasStatusOverlay) {
+    return;
+  }
+
   const { width, height } = elements.canvas;
   const panelWidth = Math.min(width * 0.7, 560);
   const panelX = 24;
@@ -1982,6 +2165,22 @@ function chooseTrackedDistalLandmark(landmarks, legSide, requireVisible) {
   return [state.tracking.lockedDistalPart, lockedIndex ?? bestIndex];
 }
 
+function getMissingLegParts(landmarks, legSide) {
+  const missing = [];
+  const leg = TRACKED_LEG_LANDMARKS[legSide];
+  if (!isLandmarkVisible(landmarks, leg.hip)) {
+    missing.push(LEG_PART_LABELS.hip);
+  }
+  if (!isLandmarkVisible(landmarks, leg.knee)) {
+    missing.push(LEG_PART_LABELS.knee);
+  }
+  const [, distalIndex] = getBestDistalLandmark(landmarks, legSide, true, null);
+  if (distalIndex === null) {
+    missing.push(LEG_PART_LABELS.distal);
+  }
+  return missing;
+}
+
 function isLegUsable(landmarks, legSide) {
   const hip = TRACKED_LEG_LANDMARKS[legSide].hip;
   const knee = TRACKED_LEG_LANDMARKS[legSide].knee;
@@ -2043,6 +2242,13 @@ function updateAngleHistory(angle) {
 
 function isAngleStable() {
   if (state.angleHistory.length < 4) {
+    return false;
+  }
+
+  const firstTimestamp = state.angleHistory[0][0];
+  const lastTimestamp = state.angleHistory[state.angleHistory.length - 1][0];
+  const timeSpan = lastTimestamp - firstTimestamp;
+  if (timeSpan < CONFIG.angleStableWindowSeconds * 1000 * 0.5) {
     return false;
   }
 
@@ -2247,7 +2453,7 @@ function rotateVector(vector, degrees) {
 }
 
 function toPixel(point) {
-  return [point[0] * elements.canvas.width, point[1] * elements.canvas.height];
+  return [(1 - point[0]) * elements.canvas.width, point[1] * elements.canvas.height];
 }
 
 function midpoint(a, b) {

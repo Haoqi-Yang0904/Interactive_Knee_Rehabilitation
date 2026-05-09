@@ -176,9 +176,10 @@ main {
 
 .hero-section {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 26px;
   align-items: stretch;
+  justify-items: center;
   padding: 42px 0 52px;
 }
 
@@ -193,8 +194,13 @@ main {
 }
 
 .hero-copy {
+  display: grid;
+  justify-items: center;
+  width: 100%;
+  max-width: 1180px;
   padding: clamp(24px, 5vw, 56px);
   border-radius: 34px;
+  text-align: center;
 }
 
 .eyebrow {
@@ -215,15 +221,16 @@ main {
 }
 
 .hero-copy h1 {
-  font-size: clamp(2.3rem, 6vw, 4.75rem);
-  max-width: 10ch;
+  max-width: 13.5em;
+  font-size: 4.15rem;
+  line-height: 1.18;
 }
 
 .hero-text {
-  max-width: 62ch;
+  max-width: 46rem;
   margin: 20px 0 0;
   color: var(--ink-soft);
-  font-size: 1.04rem;
+  font-size: 1.12rem;
   line-height: 1.85;
 }
 
@@ -236,6 +243,7 @@ main {
 }
 
 .hero-actions {
+  justify-content: center;
   margin-top: 28px;
 }
 
@@ -360,7 +368,7 @@ main {
 
 .module-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 18px;
 }
 
@@ -469,7 +477,7 @@ main {
 
 .panel-label {
   color: var(--accent-deep);
-  font-size: 0.85rem;
+  font-size: 0.98rem;
   font-weight: 700;
   letter-spacing: 0.04em;
 }
@@ -490,12 +498,24 @@ main {
 .metric-card span {
   display: block;
   color: var(--muted);
-  font-size: 0.9rem;
+  font-size: 1.08rem;
 }
 
 .metric-card strong {
   margin-top: 10px;
-  font-size: 1.3rem;
+  font-size: 1.8rem;
+}
+
+.metric-card-success {
+  grid-column: 1 / -1;
+  background:
+    linear-gradient(135deg, rgba(47, 158, 103, 0.16), rgba(255, 255, 255, 0.58)),
+    rgba(255, 255, 255, 0.56);
+  border-color: rgba(47, 158, 103, 0.2);
+}
+
+.metric-card-success strong {
+  color: #0d5b39;
 }
 
 .progress-block {
@@ -529,6 +549,113 @@ main {
   transition: width 180ms ease;
 }
 
+.demo-card {
+  overflow: hidden;
+}
+
+.demo-stage {
+  display: grid;
+  place-items: center;
+  margin: 16px 0;
+  min-height: 190px;
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.64), rgba(255, 247, 235, 0.72)),
+    rgba(255, 255, 255, 0.56);
+  border: 1px solid rgba(22, 37, 38, 0.06);
+}
+
+.demo-figure {
+  width: min(100%, 330px);
+  height: auto;
+}
+
+.demo-guide-line {
+  stroke: rgba(22, 37, 38, 0.14);
+  stroke-width: 3;
+  stroke-dasharray: 9 8;
+}
+
+.demo-head,
+.demo-joint {
+  fill: #fff8eb;
+  stroke: var(--teal);
+  stroke-width: 5;
+}
+
+.demo-torso,
+.demo-support-leg,
+.demo-limb line {
+  stroke: var(--ink);
+  stroke-width: 12;
+  stroke-linecap: round;
+}
+
+.demo-limb line,
+.demo-moving-part {
+  stroke: var(--accent);
+}
+
+.demo-joint {
+  fill: var(--accent-soft);
+  stroke: var(--accent-deep);
+  stroke-width: 4;
+}
+
+.demo-limb,
+.demo-moving-part {
+  transform-box: view-box;
+}
+
+.demo-leg .demo-moving-part {
+  transform-origin: 198px 148px;
+}
+
+.demo-arm {
+  transform-origin: 160px 72px;
+}
+
+.demo-arm .demo-moving-part {
+  transform-origin: 196px 108px;
+}
+
+.demo-card[data-demo="knee"] .demo-arm,
+.demo-card[data-demo="shoulder-forward"] .demo-leg,
+.demo-card[data-demo="shoulder-abduction"] .demo-leg,
+.demo-card[data-demo="shoulder-rotation"] .demo-leg,
+.demo-card[data-demo="shoulder-extension"] .demo-leg {
+  opacity: 0.16;
+}
+
+.demo-card[data-demo="knee"] .demo-leg .demo-moving-part {
+  animation: demo-knee-bend 2.6s ease-in-out infinite;
+}
+
+.demo-card[data-demo="shoulder-forward"] .demo-arm {
+  animation: demo-arm-forward 2.8s ease-in-out infinite;
+}
+
+.demo-card[data-demo="shoulder-abduction"] .demo-arm {
+  animation: demo-arm-abduction 2.8s ease-in-out infinite;
+}
+
+.demo-card[data-demo="shoulder-extension"] .demo-arm {
+  animation: demo-arm-extension 2.8s ease-in-out infinite;
+}
+
+.demo-card[data-demo="shoulder-rotation"] .demo-arm .demo-moving-part {
+  animation: demo-arm-rotation 2.4s ease-in-out infinite;
+}
+
+.demo-card h3 {
+  margin: 8px 0 8px;
+  font-size: 1.22rem;
+}
+
+.demo-card p {
+  margin: 0;
+}
+
 .field {
   flex: 1;
   display: grid;
@@ -543,7 +670,7 @@ main {
 .toggle span,
 .camera-pill,
 .camera-mask span {
-  font-size: 0.92rem;
+  font-size: 1rem;
 }
 
 .field select {
@@ -564,17 +691,44 @@ main {
 
 .helper-text {
   margin: 12px 0 0;
-  font-size: 0.92rem;
+  font-size: 1rem;
+}
+
+.details {
+  margin-top: 14px;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.52);
+  border: 1px solid rgba(22, 37, 38, 0.08);
+}
+
+.details-summary {
+  cursor: pointer;
+  font-size: 1.02rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.details[open] .details-summary {
+  color: var(--accent-deep);
 }
 
 .check-list {
   margin: 14px 0 0;
   padding-left: 18px;
+  font-size: 1.02rem;
+  line-height: 1.75;
 }
 
 .status-card h3 {
   margin: 12px 0 10px;
-  font-size: 1.25rem;
+  font-size: 1.48rem;
+}
+
+.status-card p,
+.progress-copy,
+.tip-log {
+  font-size: 1.04rem;
 }
 
 .tip-log {
@@ -583,6 +737,12 @@ main {
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.5);
   border: 1px solid rgba(22, 37, 38, 0.06);
+}
+
+.button-ghost {
+  padding: 8px 14px;
+  font-size: 0.9rem;
+  background: rgba(255, 255, 255, 0.6);
 }
 
 .tip-log-header {
@@ -661,7 +821,7 @@ main {
 
 .camera-stage canvas {
   pointer-events: none;
-  transform: scaleX(-1);
+  transform: none;
 }
 
 .camera-mask {
@@ -710,11 +870,65 @@ main {
   }
 }
 
+@keyframes demo-knee-bend {
+  0%,
+  100% {
+    transform: rotate(18deg);
+  }
+  50% {
+    transform: rotate(-58deg);
+  }
+}
+
+@keyframes demo-arm-forward {
+  0%,
+  100% {
+    transform: rotate(28deg);
+  }
+  50% {
+    transform: rotate(-88deg);
+  }
+}
+
+@keyframes demo-arm-abduction {
+  0%,
+  100% {
+    transform: rotate(42deg);
+  }
+  50% {
+    transform: rotate(-52deg);
+  }
+}
+
+@keyframes demo-arm-extension {
+  0%,
+  100% {
+    transform: rotate(32deg);
+  }
+  50% {
+    transform: rotate(86deg);
+  }
+}
+
+@keyframes demo-arm-rotation {
+  0%,
+  100% {
+    transform: rotate(34deg);
+  }
+  50% {
+    transform: rotate(-44deg);
+  }
+}
+
 @media (max-width: 1120px) {
   .hero-section,
   .workspace-grid,
   .module-grid {
     grid-template-columns: 1fr;
+  }
+
+  .hero-copy h1 {
+    font-size: 3.25rem;
   }
 }
 
@@ -736,6 +950,28 @@ main {
   .panel-card,
   .camera-shell {
     border-radius: 24px;
+  }
+
+  .hero-copy {
+    padding: 28px 18px;
+  }
+
+  .hero-copy h1 {
+    max-width: 10em;
+    font-size: 2.35rem;
+  }
+
+  .hero-text {
+    font-size: 1rem;
+  }
+
+  .hero-actions {
+    width: 100%;
+  }
+
+  .hero-actions .button {
+    flex: 1 1 180px;
+    text-align: center;
   }
 
   .hero-stats,
