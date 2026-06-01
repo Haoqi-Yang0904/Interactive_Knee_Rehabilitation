@@ -1,0 +1,31 @@
+name: smart_ortho_rehab
+description: MVP for intelligent orthopedic rehabilitation companion.
+publish_to: "none"
+
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.8.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  flutter_riverpod: ^3.3.1
+  camera: ^0.12.0
+  camera_android: ^0.10.10+15
+  google_mlkit_pose_detection: ^0.14.1
+  google_mlkit_commons: ^0.11.1
+  flutter_tts: ^4.2.5
+  permission_handler: ^12.0.1
+  http: ^1.6.0
+  path_provider: ^2.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

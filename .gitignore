@@ -1,10 +1,42 @@
-# Python cache files
-__pycache__/
+.DS_Store
 
-# Auto-generated pose screenshot
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Environment / local secrets
+.env
+.env.*
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+
+# Auto-generated pose screenshots
 test_pose.jpg
 test_pose/
 
 # Auto-generated test audio
 edge_test.mp3
 feedback_audio/
+
+# IDE / local
+.idea/
+.vscode/
+*.log
+*.tmp

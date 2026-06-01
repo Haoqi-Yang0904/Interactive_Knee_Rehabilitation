@@ -2,7 +2,7 @@
 mediapipe==0.10.14
 opencv-contrib-python==4.10.0.84
 numpy==1.26.4
-Pillow==12.2.0
+Pillow==11.3.0
 
 # Windows fallback system speech / COM support
 pywin32==311; sys_platform == "win32"
@@ -12,7 +12,11 @@ edge-tts==7.2.8
 pygame==2.6.1
 
 # VLM prompt demo in step3_VLM_Prompt.py
-requests==2.33.1
+requests==2.32.5
+urllib3<2
+
+# Error-map analysis UI in error_map.py
+matplotlib==3.9.4
 
 # Optional local TTS backend:
 # MeloTTS is intentionally not installed by default because it pulls large
