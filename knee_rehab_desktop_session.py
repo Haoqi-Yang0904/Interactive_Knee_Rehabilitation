@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-MacBook desktop knee rehabilitation session.
+Cross-platform desktop knee rehabilitation session.
 
 This script runs a complete knee rehab training sequence with OpenCV,
-MediaPipe pose landmarks, and macOS `say` voice prompts:
+MediaPipe pose landmarks, and local cached voice prompts:
 
 ankle pump -> quadriceps isometric -> hamstring isometric ->
 sandbag knee extension press -> supine straight leg raise ->
@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -105,8 +106,20 @@ ANGLE_STABLE_WINDOW_SECONDS = 0.7
 ANGLE_STABLE_RANGE_DEGREES = 6.0
 ANGLE_TARGET_CONFIRM_SECONDS = 0.35
 INTERRUPT_POLL_SECONDS = 0.03
+CAMERA_READ_RETRY_ATTEMPTS = 3
+CAMERA_READ_RETRY_SLEEP_SECONDS = 0.03
+CAMERA_READ_MAX_CONSECUTIVE_FAILURES = 30
+SAPI_SPEAK_ASYNC = 1
+SAPI_PURGE_BEFORE_SPEAK = 2
 
 FONT_CANDIDATES = [
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "msyh.ttc",
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "msyhbd.ttc",
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "simhei.ttf",
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "simsun.ttc",
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "Deng.ttf",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts" / "NotoSansCJK-Regular.ttc",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts" / "NotoSansSC-Regular.otf",
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/STHeiti Light.ttc",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -117,6 +130,22 @@ mp_pose = mp.solutions.pose
 
 STOP_REQUESTED = False
 ACTIVE_SPEAKER = None
+
+
+def is_windows() -> bool:
+    return sys.platform.startswith("win")
+
+
+def is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def system_voice_label() -> str:
+    if is_windows():
+        return "Windows SAPI"
+    if is_macos():
+        return "macOS say"
+    return "系统语音"
 
 
 def request_stop(_signum=None, _frame=None) -> None:
@@ -201,6 +230,14 @@ def edge_tts_is_available() -> bool:
 
 def pygame_is_available() -> bool:
     return importlib.util.find_spec("pygame") is not None
+
+
+def windows_sapi_is_available() -> bool:
+    return (
+        is_windows()
+        and importlib.util.find_spec("pythoncom") is not None
+        and importlib.util.find_spec("win32com") is not None
+    )
 
 
 def sanitize_voice_text(text: str) -> str:
@@ -309,8 +346,10 @@ class Speaker:
     ) -> None:
         self.enabled = enabled
         self.rate = str(rate)
-        self.say_path = shutil.which("say")
-        self.voice = self._select_chinese_voice(requested_voice)
+        self.say_path = shutil.which("say") if is_macos() else None
+        self.voice = self._select_macos_chinese_voice(requested_voice)
+        self.sapi_speaker = None
+        self.sapi_voice_name = self._init_windows_sapi(requested_voice)
         self.process: subprocess.Popen | None = None
         self.cache_dir = cache_dir
         self.use_edge_cache = use_edge_cache and edge_tts_is_available() and pygame_is_available()
@@ -321,11 +360,15 @@ class Speaker:
 
         if self.enabled and self.use_edge_cache:
             print(f"语音播报：优先使用本地 edge-tts 缓存，音色 {self.edge_voice}。")
-        if self.enabled and self.say_path:
+        if self.enabled and self.sapi_speaker is not None:
+            print(f"语音播报兜底：Windows SAPI {self.sapi_voice_name}，语速 {self._windows_sapi_rate()}")
+        elif self.enabled and self.say_path:
             if self.voice:
                 print(f"语音播报兜底：macOS 中文音色 {self.voice}，语速 {self.rate}")
             else:
                 print("语音播报兜底：未找到 zh_CN 中文音色，将使用系统默认音色。")
+        elif self.enabled and not self.use_edge_cache:
+            print(f"语音播报兜底不可用：未找到可用的{system_voice_label()}。")
 
     def _available_voices(self) -> list[tuple[str, str]]:
         if not self.say_path:
@@ -347,7 +390,7 @@ class Speaker:
                 voices.append((match.group(1).strip(), match.group(2)))
         return voices
 
-    def _select_chinese_voice(self, requested_voice: str | None) -> str | None:
+    def _select_macos_chinese_voice(self, requested_voice: str | None) -> str | None:
         voices = self._available_voices()
         if not voices:
             return None
@@ -380,6 +423,63 @@ class Speaker:
             if locale.startswith("zh_"):
                 return voice
         return None
+
+    def _windows_sapi_rate(self) -> int:
+        try:
+            numeric_rate = int(self.rate)
+        except ValueError:
+            numeric_rate = DEFAULT_VOICE_RATE
+        # SAPI uses -10..10. Map the user-facing say-style range roughly around default 145 -> 0.
+        return max(-10, min(10, int(round((numeric_rate - DEFAULT_VOICE_RATE) / 7.0))))
+
+    def _init_windows_sapi(self, requested_voice: str | None) -> str | None:
+        if not self.enabled or not windows_sapi_is_available():
+            return None
+        try:
+            import pythoncom
+            from win32com.client import Dispatch
+
+            pythoncom.CoInitialize()
+            self.sapi_speaker = Dispatch("SAPI.SpVoice")
+            self.sapi_speaker.Rate = self._windows_sapi_rate()
+            self.sapi_speaker.Volume = 100
+            return self._select_windows_chinese_voice(requested_voice)
+        except Exception as exc:
+            print(f"Windows SAPI 初始化失败，将只使用语音缓存或静音兜底：{exc}")
+            self.sapi_speaker = None
+            return None
+
+    def _select_windows_chinese_voice(self, requested_voice: str | None) -> str:
+        if self.sapi_speaker is None:
+            return "不可用"
+
+        requested = requested_voice.strip().lower() if requested_voice else ""
+        fallback_voice = None
+        try:
+            voices = self.sapi_speaker.GetVoices()
+            for index in range(voices.Count):
+                voice = voices.Item(index)
+                description = voice.GetDescription()
+                language = voice.GetAttribute("Language")
+                is_chinese = "804" in language.lower() or "chinese" in description.lower()
+
+                if requested and requested in description.lower():
+                    self.sapi_speaker.Voice = voice
+                    return description
+
+                if fallback_voice is None and is_chinese:
+                    fallback_voice = voice
+
+            if fallback_voice is not None:
+                self.sapi_speaker.Voice = fallback_voice
+                return fallback_voice.GetDescription()
+        except Exception:
+            pass
+
+        try:
+            return self.sapi_speaker.Voice.GetDescription()
+        except Exception:
+            return "Windows 默认语音"
 
     def speak(self, text: str, *, interrupt: bool = True) -> None:
         self._speak(text, interrupt=interrupt, wait=False)
@@ -447,7 +547,13 @@ class Speaker:
         if self._pygame is not None:
             return self._pygame
 
-        import pygame
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="pkg_resources is deprecated as an API.*",
+                category=UserWarning,
+            )
+            import pygame
 
         if not pygame.mixer.get_init():
             pygame.mixer.init()
@@ -455,6 +561,35 @@ class Speaker:
         return pygame
 
     def _speak_system(self, text: str, *, interrupt: bool, wait: bool) -> None:
+        if self.sapi_speaker is not None:
+            self._speak_windows_sapi(text, interrupt=interrupt, wait=wait)
+            return
+
+        self._speak_macos_say(text, interrupt=interrupt, wait=wait)
+
+    def _speak_windows_sapi(self, text: str, *, interrupt: bool, wait: bool) -> None:
+        if self.sapi_speaker is None:
+            return
+
+        try:
+            if not interrupt and not self.sapi_speaker.WaitUntilDone(0):
+                return
+
+            flags = SAPI_SPEAK_ASYNC
+            if interrupt:
+                flags |= SAPI_PURGE_BEFORE_SPEAK
+            self.sapi_speaker.Speak(text, flags)
+
+            if wait:
+                while not self.sapi_speaker.WaitUntilDone(30) and not stop_requested():
+                    time.sleep(INTERRUPT_POLL_SECONDS)
+                if stop_requested():
+                    self.sapi_speaker.Speak("", SAPI_PURGE_BEFORE_SPEAK)
+        except Exception as exc:
+            print(f"Windows SAPI 播报失败：{exc}")
+            self.sapi_speaker = None
+
+    def _speak_macos_say(self, text: str, *, interrupt: bool, wait: bool) -> None:
         if not self.say_path:
             return
 
@@ -506,6 +641,12 @@ class Speaker:
                     return True
             except Exception:
                 pass
+        if self.sapi_speaker is not None:
+            try:
+                if not self.sapi_speaker.WaitUntilDone(0):
+                    return True
+            except Exception:
+                pass
         return self.process is not None and self.process.poll() is None
 
     def stop(self) -> None:
@@ -513,6 +654,11 @@ class Speaker:
             try:
                 self._pygame.mixer.music.stop()
                 self._pygame.mixer.music.unload()
+            except Exception:
+                pass
+        if self.sapi_speaker is not None:
+            try:
+                self.sapi_speaker.Speak("", SAPI_PURGE_BEFORE_SPEAK)
             except Exception:
                 pass
         if self.process is not None and self.process.poll() is None:
@@ -654,7 +800,7 @@ def parse_exercise_ids(raw_values: list[str] | None) -> list[str] | None:
 
 
 def system_camera_names() -> list[str]:
-    if sys.platform != "darwin":
+    if not is_macos():
         return []
     try:
         output = subprocess.run(
@@ -680,7 +826,7 @@ def camera_index_candidates(camera_index: int) -> list[int]:
     if camera_index >= 0:
         return [camera_index]
 
-    if sys.platform == "darwin":
+    if is_macos():
         if len(system_camera_names()) <= 1:
             return [0]
         # With multiple cameras, Continuity Camera can take index 0.
@@ -689,57 +835,92 @@ def camera_index_candidates(camera_index: int) -> list[int]:
 
 
 def camera_backend_candidates() -> list[int]:
-    if sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+    if is_macos() and hasattr(cv2, "CAP_AVFOUNDATION"):
         return [cv2.CAP_AVFOUNDATION]
-    if hasattr(cv2, "CAP_AVFOUNDATION"):
-        return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+    if is_windows():
+        candidates = []
+        for backend_name_value in ("CAP_DSHOW", "CAP_MSMF"):
+            if hasattr(cv2, backend_name_value):
+                candidates.append(getattr(cv2, backend_name_value))
+        candidates.append(cv2.CAP_ANY)
+        return list(dict.fromkeys(candidates))
     return [cv2.CAP_ANY]
 
 
 def backend_name(backend: int) -> str:
     if hasattr(cv2, "CAP_AVFOUNDATION") and backend == cv2.CAP_AVFOUNDATION:
         return "AVFOUNDATION"
+    if hasattr(cv2, "CAP_DSHOW") and backend == cv2.CAP_DSHOW:
+        return "DSHOW"
+    if hasattr(cv2, "CAP_MSMF") and backend == cv2.CAP_MSMF:
+        return "MSMF"
     if backend == cv2.CAP_ANY:
         return "CAP_ANY"
     return str(backend)
 
 
-def probe_camera_indices(max_index: int = 6) -> list[int]:
-    available: list[int] = []
-    backend = camera_backend_candidates()[0]
-    for index in range(max_index + 1):
+def read_camera_frame(cap: cv2.VideoCapture, *, attempts: int = CAMERA_READ_RETRY_ATTEMPTS) -> np.ndarray | None:
+    """Read one camera frame while guarding against backend-specific OpenCV exceptions."""
+    for attempt in range(max(1, attempts)):
         try:
-            cap = cv2.VideoCapture(index, backend)
-        except Exception:
-            continue
-        ok = cap.isOpened()
-        if ok:
+            ok, frame = cap.read()
+        except cv2.error:
+            ok = False
+            frame = None
+
+        if ok and frame is not None and getattr(frame, "size", 0) > 0:
+            return frame
+
+        if attempt + 1 < attempts:
+            time.sleep(CAMERA_READ_RETRY_SLEEP_SECONDS)
+
+    return None
+
+
+def probe_camera_indices(max_index: int = 6) -> list[int]:
+    available: set[int] = set()
+    for backend in camera_backend_candidates():
+        for index in range(max_index + 1):
             try:
-                ok, _frame = cap.read()
+                cap = cv2.VideoCapture(index, backend)
             except Exception:
-                ok = False
-        cap.release()
-        if ok:
-            available.append(index)
-    return available
+                continue
+            ok = cap.isOpened()
+            if ok:
+                ok = read_camera_frame(cap, attempts=1) is not None
+            cap.release()
+            if ok:
+                available.add(index)
+    return sorted(available)
 
 
 def print_camera_help(*, probe_indices: bool = False) -> None:
     names = system_camera_names()
-    if names:
-        print("macOS 检测到的本机摄像头：")
-        for name in names:
-            print(f"- {name}")
+    if is_macos():
+        if names:
+            print("macOS 检测到的本机摄像头：")
+            for name in names:
+                print(f"- {name}")
+        else:
+            print("macOS 没有返回摄像头名称。")
+    elif is_windows():
+        print("Windows 无法像 macOS 一样稳定列出摄像头名称；建议使用 --probe-cameras 探测 OpenCV 可打开的序号。")
     else:
-        print("macOS 没有返回摄像头名称。")
+        print("当前系统将通过 OpenCV 探测摄像头序号。")
 
     if not probe_indices:
-        if len(names) <= 1:
-            print("当前只检测到一个摄像头，AVFoundation 序号通常是 index 0。")
-            print("建议直接运行：knee_rehab_desktop_session.py --target 3 --camera 0")
+        if is_macos():
+            if len(names) <= 1:
+                print("当前只检测到一个摄像头，AVFoundation 序号通常是 index 0。")
+                print("建议直接运行：knee_rehab_desktop_session.py --target 3 --camera 0")
+            else:
+                print("检测到多个摄像头时，默认会优先尝试 index 1、2，再回退到 index 0。")
+                print("如果仍连到手机，请加 --probe-cameras 探测可打开序号，或直接用 --camera 1 / --camera 2 试。")
+        elif is_windows():
+            print("Windows 默认依次尝试 DSHOW、MSMF、CAP_ANY 后端和 index 0..5。")
+            print("如果默认摄像头不对，请运行 --probe-cameras，或直接用 --camera 0 / --camera 1 指定。")
         else:
-            print("检测到多个摄像头时，默认会优先尝试 index 1、2，再回退到 index 0。")
-            print("如果仍连到手机，请加 --probe-cameras 探测可打开序号，或直接用 --camera 1 / --camera 2 试。")
+            print("如果默认摄像头不对，请运行 --probe-cameras，或直接用 --camera 指定序号。")
         return
 
     indices = probe_camera_indices()
@@ -747,9 +928,9 @@ def print_camera_help(*, probe_indices: bool = False) -> None:
         print("OpenCV 可打开的摄像头序号：")
         for index in indices:
             print(f"- index {index}")
-        print("如果默认仍连到手机，请用 --camera 指定 FaceTime 对应的序号。")
+        print("如果默认摄像头不对，请用 --camera 指定对应序号。")
     else:
-        print("OpenCV 没有探测到可打开的摄像头。请检查 Terminal/VSCode 摄像头权限。")
+        print("OpenCV 没有探测到可打开的摄像头。请检查系统摄像头权限，或关闭正在占用摄像头的应用。")
 
 
 def open_camera(camera_index: int) -> cv2.VideoCapture:
@@ -768,23 +949,24 @@ def open_camera(camera_index: int) -> cv2.VideoCapture:
             if not cap.isOpened():
                 cap.release()
                 continue
-            try:
-                ok, _ = cap.read()
-            except Exception:
-                ok = False
-            if ok:
+            if read_camera_frame(cap, attempts=2) is not None:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 print(f"摄像头已打开：index={index}, backend={backend_name(backend)}")
-                if camera_index < 0 and index == 0 and sys.platform == "darwin":
+                if camera_index < 0 and index == 0 and is_macos():
                     print("提示：如果这里仍然是手机摄像头，请运行 --list-cameras 后用 --camera 指定内置摄像头序号。")
                 return cap
             cap.release()
 
     attempted_text = "；".join(attempted) if attempted else "未尝试任何摄像头"
+    if is_macos():
+        reason = "无法打开摄像头。macOS 下已禁用 OpenCV 的 CAP_ANY 回退，以避免触发 OBSENSOR/Orbbec 后端异常。"
+    elif is_windows():
+        reason = "无法打开摄像头。Windows 下已尝试 DSHOW/MSMF/CAP_ANY 后端。"
+    else:
+        reason = "无法打开摄像头。"
     raise RuntimeError(
-        "无法打开摄像头。macOS 下已禁用 OpenCV 的 CAP_ANY 回退，以避免触发 OBSENSOR/Orbbec 后端异常。"
-        f"已尝试：{attempted_text}。请检查 Terminal/VSCode 摄像头权限，或用 --camera 0/1/2 指定序号。"
+        f"{reason}已尝试：{attempted_text}。请检查摄像头权限，或用 --camera 0/1/2 指定序号。"
     )
 
 
@@ -1905,6 +2087,7 @@ def run_timer_exercise(
     visibility_cue_pending = False
     visibility_pause_spoken = False
     visibility_was_paused = False
+    consecutive_camera_failures = 0
 
     speaker.speak_and_wait(f"{exercise.name}。")
     if exercise.mode == "ankle_hybrid":
@@ -1960,10 +2143,14 @@ def run_timer_exercise(
         return min(active_seconds, exercise.target_units * cycle_total)
 
     while completed < exercise.target_units and not stop_requested():
-        ok, camera_frame = cap.read()
-        if not ok:
-            warnings.append("摄像头读取失败")
-            break
+        camera_frame = read_camera_frame(cap)
+        if camera_frame is None:
+            consecutive_camera_failures += 1
+            if consecutive_camera_failures >= CAMERA_READ_MAX_CONSECUTIVE_FAILURES:
+                warnings.append("摄像头连续读取失败")
+                break
+            continue
+        consecutive_camera_failures = 0
         frame = display_frame_for(camera_frame, mirror)
 
         now = time.monotonic()
@@ -2229,6 +2416,7 @@ def run_visual_exercise(
     knee_line_smoother = ScalarSmoother(alpha=0.25, max_jump=0.10)
     movement_angle_smoother = ScalarSmoother(alpha=0.25, max_jump=12.0)
     movement_distance_smoother = ScalarSmoother(alpha=0.25, max_jump=12.0)
+    consecutive_camera_failures = 0
 
     def reset_motion_smoothers() -> None:
         displacement_smoother.reset()
@@ -2246,10 +2434,14 @@ def run_visual_exercise(
     speaker.speak("摆好姿势。")
 
     while completed < exercise.target_units and not stop_requested():
-        ok, camera_frame = cap.read()
-        if not ok:
-            warnings.append("摄像头读取失败")
-            break
+        camera_frame = read_camera_frame(cap)
+        if camera_frame is None:
+            consecutive_camera_failures += 1
+            if consecutive_camera_failures >= CAMERA_READ_MAX_CONSECUTIVE_FAILURES:
+                warnings.append("摄像头连续读取失败")
+                break
+            continue
+        consecutive_camera_failures = 0
         frame = display_frame_for(camera_frame, mirror)
 
         result = detect_pose(pose, camera_frame)
@@ -2615,15 +2807,20 @@ def run_flexion_visual_exercise(
     lift_stability = AngleStabilityTracker(max_range_degrees=5.0)
     flexion_target_started_at: float | None = None
     lift_target_started_at: float | None = None
+    consecutive_camera_failures = 0
 
     speaker.speak_and_wait(f"{exercise.name}。")
     speaker.speak("摆好姿势。")
 
     while completed < exercise.target_units and not stop_requested():
-        ok, camera_frame = cap.read()
-        if not ok:
-            warnings.append("摄像头读取失败")
-            break
+        camera_frame = read_camera_frame(cap)
+        if camera_frame is None:
+            consecutive_camera_failures += 1
+            if consecutive_camera_failures >= CAMERA_READ_MAX_CONSECUTIVE_FAILURES:
+                warnings.append("摄像头连续读取失败")
+                break
+            continue
+        consecutive_camera_failures = 0
         frame = display_frame_for(camera_frame, mirror)
 
         result = detect_pose(pose, camera_frame)
@@ -3001,8 +3198,8 @@ def show_summary_until_quit(
     mirror: bool,
 ) -> None:
     while not stop_requested():
-        ok, frame = cap.read()
-        if not ok:
+        frame = read_camera_frame(cap)
+        if frame is None:
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         elif mirror:
             frame = cv2.flip(frame, 1)
@@ -3013,16 +3210,16 @@ def show_summary_until_quit(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MacBook 膝关节完整康复训练脚本")
+    parser = argparse.ArgumentParser(description="跨平台膝关节完整康复训练脚本")
     parser.add_argument("--target", type=int, default=DEFAULT_TARGET_UNITS, help="每个动作目标次数，默认 10")
     parser.add_argument(
         "--camera",
         type=int,
         default=DEFAULT_CAMERA_INDEX,
-        help="摄像头编号；默认自动优先尝试 Mac 内置摄像头，仍连手机时用 --list-cameras 后手动指定",
+        help="摄像头编号；默认自动尝试常用摄像头序号，可用 --probe-cameras 后手动指定",
     )
-    parser.add_argument("--list-cameras", action="store_true", help="列出 macOS 系统摄像头名称，不打开摄像头")
-    parser.add_argument("--probe-cameras", action="store_true", help="实际尝试打开摄像头序号；可能触发 macOS 权限提示")
+    parser.add_argument("--list-cameras", action="store_true", help="显示摄像头选择建议，不打开摄像头")
+    parser.add_argument("--probe-cameras", action="store_true", help="实际尝试打开摄像头序号；可能触发系统摄像头权限提示")
     parser.add_argument(
         "--side",
         choices=["auto", "left", "right"],
@@ -3048,13 +3245,13 @@ def parse_args() -> argparse.Namespace:
         help="仅用于测试时覆盖沙袋压腿保持秒数；临床默认仍为 15 分钟",
     )
     parser.add_argument("--no-voice", action="store_true", help="关闭语音播报")
-    parser.add_argument("--voice", default=None, help="指定 macOS say 兜底音色，例如 Tingting")
-    parser.add_argument("--voice-rate", type=int, default=DEFAULT_VOICE_RATE, help="macOS say 兜底语音速度，默认 145")
+    parser.add_argument("--voice", default=None, help="指定系统语音兜底音色，例如 Windows 的 Huihui 或 macOS 的 Tingting")
+    parser.add_argument("--voice-rate", type=int, default=DEFAULT_VOICE_RATE, help="系统语音兜底语速，默认 145")
     parser.add_argument(
         "--tts-engine",
-        choices=["edge_cache", "say"],
+        choices=["edge_cache", "system", "say"],
         default="edge_cache",
-        help="语音引擎：edge_cache 为本地神经语音缓存，say 为 macOS 系统语音",
+        help="语音引擎：edge_cache 为本地神经语音缓存，system/say 为系统语音兜底",
     )
     parser.add_argument("--edge-voice", default=DEFAULT_EDGE_VOICE, help="edge-tts 音色")
     parser.add_argument("--edge-rate", default=DEFAULT_EDGE_RATE, help="edge-tts 语速，例如 -10%%")
@@ -3154,8 +3351,8 @@ def main() -> None:
             else:
                 print(f"本地语音缓存已就绪，共 {skipped} 条。")
         except Exception as exc:
-            print(f"语音缓存准备失败，将回退到 macOS say：{exc}")
-            args.tts_engine = "say"
+            print(f"语音缓存准备失败，将回退到{system_voice_label()}：{exc}")
+            args.tts_engine = "system"
 
     renderer = TextRenderer()
     speaker = Speaker(
@@ -3179,10 +3376,15 @@ def main() -> None:
         except RuntimeError as exc:
             print(f"摄像头启动失败：{exc}")
             print("建议：")
-            print("1. 在 macOS 系统设置 -> 隐私与安全性 -> 摄像头 中允许 VSCode/Terminal。")
+            if is_macos():
+                print("1. 在 macOS 系统设置 -> 隐私与安全性 -> 摄像头 中允许 VSCode/Terminal。")
+            elif is_windows():
+                print("1. 在 Windows 设置 -> 隐私和安全性 -> 摄像头 中允许桌面应用访问摄像头。")
+            else:
+                print("1. 检查系统摄像头权限。")
             print("2. 关闭正在占用摄像头的应用。")
             print("3. 分别尝试 --camera 0、--camera 1、--camera 2。")
-            print("4. 运行 --list-cameras 查看系统摄像头名称，运行 --probe-cameras 探测 OpenCV 序号。")
+            print("4. 运行 --list-cameras 查看平台提示，运行 --probe-cameras 探测 OpenCV 序号。")
             return
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, 1280, 720)

@@ -13,10 +13,10 @@
 ### 1. 先测后端
 
 ```bash
-cd /path/to/Interactive_Knee_Rehabilitation/backend
-python3 -m venv .venv
-source .venv/bin/activate
+cd /path/to/Interactive_Knee_Rehabilitation
+conda activate knee_rehab_env
 pip install -r requirements.txt
+cd backend
 uvicorn app.main:app --reload
 ```
 
@@ -99,21 +99,15 @@ flutter run
 pip install -r requirements.txt
 ```
 
-以安装必要的依赖。如果复用 `backend/.venv` 来运行根目录下的 `step*.py` 原型脚本，请在项目根目录运行：
+以安装必要的依赖。现在推荐统一使用 `knee_rehab_env` 这个 conda 环境运行后端和根目录下的 `step*.py` / `knee_rehab_desktop_session.py` 脚本。`backend/requirements.txt` 仅保留给只部署后端服务的场景；完整本地开发请优先使用根目录 `requirements.txt`。
 
-```
-backend/.venv/bin/python -m pip install -r requirements.txt
-```
-
-`backend/requirements.txt` 只包含 FastAPI 后端依赖，不包含 OpenCV、MediaPipe、pygame 等动作识别原型脚本依赖。
-
-## MacBook 电脑端完整膝关节训练测试
+## 电脑端完整膝关节训练测试
 
 如果暂时不测试手机端，可以直接运行电脑端完整训练脚本：
 
 ```bash
 cd /path/to/Interactive_Knee_Rehabilitation
-backend/.venv/bin/python knee_rehab_desktop_session.py
+python knee_rehab_desktop_session.py
 ```
 
 默认顺序为：
@@ -125,35 +119,35 @@ backend/.venv/bin/python knee_rehab_desktop_session.py
 默认每个动作 10 次。第一次只是快速试跑时，可以改成每个动作 3 次：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --target 3
+python knee_rehab_desktop_session.py --target 3
 ```
 
-摄像头默认会根据 macOS 检测到的设备数选择序号：如果只检测到一个摄像头，默认直接用 `index 0`；如果检测到多个摄像头，才会优先尝试 `index 1`、`index 2`，再回退到 `index 0`，目的是避开连续互通相机里常见的 iPhone 摄像头。先查看系统识别到的摄像头：
+摄像头默认会按当前系统选择后端和序号：Windows 依次尝试 `DSHOW`、`MSMF`、`CAP_ANY` 后端和 `index 0..5`；macOS 优先使用 `AVFOUNDATION`，检测到多个摄像头时会优先尝试 `index 1`、`index 2`，再回退到 `index 0`，目的是避开连续互通相机里常见的 iPhone 摄像头。先查看系统提示：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --list-cameras
+python knee_rehab_desktop_session.py --list-cameras
 ```
 
-如果终端出现 `out device of bound (0-0): 1`，说明当前只有一个 AVFoundation 摄像头，必须用：
+如果 macOS 终端出现 `out device of bound (0-0): 1`，说明当前只有一个 AVFoundation 摄像头，必须用：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --target 3 --camera 0
+python knee_rehab_desktop_session.py --target 3 --camera 0
 ```
 
 如果检测到多个摄像头，并且 `index 0` 连到手机，再试：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --target 3 --camera 1
+python knee_rehab_desktop_session.py --target 3 --camera 1
 ```
 
-如果需要实际探测 OpenCV 能打开哪些序号，可以运行 `--probe-cameras`，但这可能触发 macOS 摄像头权限提示。
+如果需要实际探测 OpenCV 能打开哪些序号，可以运行 `--probe-cameras`，但这可能触发系统摄像头权限提示。
 
-macOS 上脚本会强制使用 OpenCV 的 `AVFOUNDATION` 摄像头后端，不再回退到 `CAP_ANY`，避免误触发 `OBSENSOR/Orbbec` 后端导致 `No device found` 异常。
+macOS 上脚本会强制使用 OpenCV 的 `AVFOUNDATION` 摄像头后端，不再回退到 `CAP_ANY`，避免误触发 `OBSENSOR/Orbbec` 后端导致 `No device found` 异常。Windows 上脚本会优先尝试 `DSHOW` 和 `MSMF`，比直接使用 `CAP_ANY` 更稳定。
 
-脚本默认使用 `edge-tts` 生成本地神经语音缓存，训练时优先播放本地 mp3；如果缓存不可用，才回退到 macOS `say`。可以先单独生成语音库：
+脚本默认使用 `edge-tts` 生成本地神经语音缓存，训练时优先播放本地 mp3；如果缓存不可用，Windows 会回退到 SAPI，macOS 会回退到 `say`。可以先单独生成语音库：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --target 10 --prepare-voice-cache
+python knee_rehab_desktop_session.py --target 10 --prepare-voice-cache
 ```
 
 缓存目录默认是 `feedback_audio/knee_desktop_session/`。当前桌面脚本只缓存短句提示，例如“准备，开始。”“抬起。”“保持。”“放下。”，避免长句播报拖慢动作节奏。
@@ -161,19 +155,19 @@ backend/.venv/bin/python knee_rehab_desktop_session.py --target 10 --prepare-voi
 每个动作会先等待起始位稳定，再播报“准备，开始。”。股四头肌等长和腘绳肌等长现在也会通过画面识别髋、膝、踝和膝伸直状态，起始位稳定后自动开始，不需要按键。播报完成后默认额外等待 2 秒，给用户反应和开始动作的时间。可以调整这个反应时间：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --target 3 --reaction-seconds 2.5
+python knee_rehab_desktop_session.py --target 3 --reaction-seconds 2.5
 ```
 
 默认神经语音音色是 `zh-CN-XiaoxiaoNeural`，语速是 `-10%`。如果想换音色或语速：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --target 3 --edge-voice zh-CN-XiaoyiNeural --edge-rate -15%
+python knee_rehab_desktop_session.py --target 3 --edge-voice zh-CN-XiaoyiNeural --edge-rate -15%
 ```
 
-如果不想用神经语音缓存，也可以强制使用 macOS 系统语音：
+如果不想用神经语音缓存，也可以强制使用系统语音：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --target 3 --tts-engine say --voice Tingting --voice-rate 135
+python knee_rehab_desktop_session.py --target 3 --tts-engine system --voice Tingting --voice-rate 135
 ```
 
 视觉识别动作采用“起始位稳定 -> 抬到标准位 -> 标准位保持达标 -> 控制放回起始位 -> 计 1 次”的流程，不再只靠抬起/放下瞬间计数。程序会锁定同一侧腿，短时保留上一帧有效骨架，平滑膝角和脚踝位移，减少左右腿切换和关键点跳变。
@@ -195,7 +189,7 @@ backend/app/services/knee_rehab_library.py
 只查看动作列表、不打开摄像头：
 
 ```bash
-backend/.venv/bin/python knee_rehab_desktop_session.py --list
+python knee_rehab_desktop_session.py --list
 ```
 
 运行时按键：
@@ -241,13 +235,13 @@ r 重置视觉计数起始位
 
 ### 3. 新增电脑端完整膝关节训练脚本
 
-新增 `knee_rehab_desktop_session.py`，不再只是单一屈膝角度检测，而是一个 MacBook 电脑端完整训练 session：
+新增 `knee_rehab_desktop_session.py`，不再只是单一屈膝角度检测，而是一个跨平台电脑端完整训练 session：
 
 - 默认训练顺序包括踝泵、股四头肌等长、腘绳肌等长、仰卧直抬腿、侧抬腿、后抬腿、内收抬腿等动作。
 - 支持 `--list` 查看动作列表、`--target` 调整每个动作目标次数、`--list-cameras` 查看摄像头、`--probe-cameras` 实际探测可打开的摄像头。
-- macOS 上强制使用 OpenCV `AVFOUNDATION` 摄像头后端，避免误触发 `OBSENSOR/Orbbec` 后端造成无设备异常。
+- macOS 上强制使用 OpenCV `AVFOUNDATION` 摄像头后端，避免误触发 `OBSENSOR/Orbbec` 后端造成无设备异常；Windows 上优先尝试 `DSHOW/MSMF/CAP_ANY`。
 - 训练流程从“检测瞬间抬起/放下”升级为“起始位稳定 -> 达到目标位 -> 保持达标 -> 控制回到起始位 -> 计 1 次”。
-- 支持短句 edge-tts 本地语音缓存，训练时优先播放本地 mp3，缓存不可用时才回退到 macOS `say`。
+- 支持短句 edge-tts 本地语音缓存，训练时优先播放本地 mp3，缓存不可用时 Windows 回退到 SAPI、macOS 回退到 `say`。
 - 支持按 `q` 退出、`n` 跳过当前动作、`r` 重置视觉计数起始位；退出时会立即停止当前语音。
 - 训练结果会保存到 `test_pose/knee_desktop_session_*/summary.json`。
 

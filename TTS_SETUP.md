@@ -1,22 +1,22 @@
 # 本地语音模型接入说明
 
-当前电脑端膝关节训练程序默认优先使用 `edge-tts` 的中文神经网络音色，并把短语音缓存成 mp3；失败时回退到 macOS 自带的 `say`。
+当前电脑端膝关节训练程序默认优先使用 `edge-tts` 的中文神经网络音色，并把短语音缓存成 mp3；失败时 Windows 回退到 SAPI，macOS 回退到自带的 `say`。
 
 ```bash
-cd /Users/xieluxiang/therapy_proj
-/Users/xieluxiang/therapy_proj/backend/.venv/bin/python knee_rehab_desktop_session.py --target 3
+cd /path/to/Interactive_Knee_Rehabilitation
+python knee_rehab_desktop_session.py --target 3
 ```
 
 可以手动切换音色和语速：
 
 ```bash
-/Users/xieluxiang/therapy_proj/backend/.venv/bin/python knee_rehab_desktop_session.py --target 3 --edge-voice zh-CN-XiaoyiNeural --edge-rate -10%
+python knee_rehab_desktop_session.py --target 3 --edge-voice zh-CN-XiaoyiNeural --edge-rate -10%
 ```
 
 先单独生成或补齐本地语音缓存：
 
 ```bash
-/Users/xieluxiang/therapy_proj/backend/.venv/bin/python knee_rehab_desktop_session.py --target 10 --prepare-voice-cache
+python knee_rehab_desktop_session.py --target 10 --prepare-voice-cache
 ```
 
 当前脚本使用短句提示，例如“准备，开始。”“勾脚。”“抬起。”“保持。”“放下。”，并且计时会等语音播完后再开始。动作开始前默认额外等待 2 秒，可用 `--reaction-seconds 2.5` 调整。股四头肌等长和腘绳肌等长会识别起始位稳定后自动开始。
@@ -61,4 +61,4 @@ TTS_ENGINE=melo MELO_SPEED=0.9 MELO_DEVICE=cpu python3 step1_MediaPipe.py
 TTS_ENGINE=melo MELO_DEVICE=cpu MELO_SPEED=0.95 python3 step1_MediaPipe.py
 ```
 
-如果运行时第一次语音很久才出来，说明模型加载/合成较慢；这时可以继续用默认 `say`，或者后续改接云端 TTS。
+如果运行时第一次语音很久才出来，说明模型加载/合成较慢；这时可以继续用默认系统语音兜底，或者后续改接云端 TTS。

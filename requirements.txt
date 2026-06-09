@@ -18,6 +18,13 @@ urllib3<2
 # Error-map analysis UI in error_map.py
 matplotlib==3.9.4
 
+# Backend API runtime
+fastapi>=0.112
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0,<2.1
+aiosqlite>=0.20,<0.21
+greenlet>=3.0,<4.0
+
 # Optional local TTS backend:
 # MeloTTS is intentionally not installed by default because it pulls large
 # ML/audio dependencies. See TTS_SETUP.md if you want TTS_ENGINE=melo.
