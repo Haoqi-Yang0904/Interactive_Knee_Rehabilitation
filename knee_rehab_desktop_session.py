@@ -109,8 +109,6 @@ INTERRUPT_POLL_SECONDS = 0.03
 CAMERA_READ_RETRY_ATTEMPTS = 3
 CAMERA_READ_RETRY_SLEEP_SECONDS = 0.03
 CAMERA_READ_MAX_CONSECUTIVE_FAILURES = 30
-SCREENSHOT_INTERVAL_SECONDS = 5.0
-SCREENSHOT_JPEG_QUALITY = 92
 SAPI_SPEAK_ASYNC = 1
 SAPI_PURGE_BEFORE_SPEAK = 2
 
@@ -224,32 +222,6 @@ class TrackedLegState:
         self.locked_distal_part = None
         self.distal_candidate = None
         self.distal_candidate_frames = 0
-
-
-@dataclass
-class ScreenshotRecorder:
-    output_dir: Path
-    interval_seconds: float = SCREENSHOT_INTERVAL_SECONDS
-    last_saved_at: float = field(default=0.0, init=False)
-    saved_count: int = field(default=0, init=False)
-
-    def maybe_save(self, frame: np.ndarray) -> None:
-        now = time.monotonic()
-        if self.last_saved_at and now - self.last_saved_at < self.interval_seconds:
-            return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        output_path = self.output_dir / f"screen_{timestamp}.jpg"
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, SCREENSHOT_JPEG_QUALITY],
-        )
-        if not ok:
-            return
-        encoded.tofile(str(output_path))
-        self.last_saved_at = now
-        self.saved_count += 1
 
 
 def edge_tts_is_available() -> bool:
@@ -1472,6 +1444,16 @@ def knee_line_deviation_ratio(leg: LegPoints) -> float:
     return cross / (length * max(leg.leg_length, 1.0))
 
 
+def straight_leg_raise_angle_degrees(leg: LegPoints) -> float:
+    distal = leg.ankle if leg.ankle_visible else leg.distal
+    vector = distal - leg.hip
+    horizontal = abs(float(vector[0]))
+    upward = max(0.0, -float(vector[1]))
+    if horizontal <= 1e-6 and upward <= 1e-6:
+        return 0.0
+    return math.degrees(math.atan2(upward, max(horizontal, 1e-6)))
+
+
 def point_to_pixel(point: np.ndarray, width: int, height: int) -> tuple[int, int]:
     clipped = np.array(
         [
@@ -1609,6 +1591,99 @@ def draw_dashed_line(
             thickness,
             cv2.LINE_AA,
         )
+
+
+def draw_knee_extension_arrow(frame: np.ndarray, leg: LegPoints) -> None:
+    distal = leg.ankle if leg.ankle_visible else leg.distal
+    thigh_unit = normalized_vector(leg.hip - leg.knee)
+    shank_unit = normalized_vector(distal - leg.knee)
+    if thigh_unit is None or shank_unit is None:
+        return
+
+    target_unit = -thigh_unit
+    current_angle = math.atan2(float(shank_unit[1]), float(shank_unit[0]))
+    target_angle = math.atan2(float(target_unit[1]), float(target_unit[0]))
+    delta = (target_angle - current_angle + math.pi) % math.tau - math.pi
+    if abs(delta) < math.radians(8.0):
+        return
+
+    center = leg.knee.astype(np.float32)
+    radius = int(max(24, min(72, leg.leg_length * 0.18)))
+    steps = max(10, int(abs(delta) / math.radians(6.0)))
+    angles = np.linspace(current_angle, current_angle + delta, steps)
+    points = np.array(
+        [
+            center + np.array([math.cos(angle), math.sin(angle)], dtype=np.float32) * radius
+            for angle in angles
+        ],
+        dtype=np.int32,
+    )
+    color = (0, 190, 255)
+    cv2.polylines(frame, [points], False, color, 4, cv2.LINE_AA)
+
+    if len(points) >= 2:
+        cv2.arrowedLine(
+            frame,
+            tuple(points[-2]),
+            tuple(points[-1]),
+            color,
+            4,
+            cv2.LINE_AA,
+            tipLength=0.45,
+        )
+    cv2.circle(frame, tuple(np.round(center).astype(int)), 9, (20, 20, 20), -1, cv2.LINE_AA)
+    cv2.circle(frame, tuple(np.round(center).astype(int)), 6, (245, 245, 245), -1, cv2.LINE_AA)
+
+
+def draw_straight_leg_raise_guides(
+    frame: np.ndarray,
+    leg: LegPoints | None,
+    *,
+    target_angle_degrees: float,
+    current_angle_degrees: float | None,
+    knee_straight: bool,
+    stage: str,
+) -> None:
+    if leg is None:
+        return
+
+    distal = leg.ankle if leg.ankle_visible else leg.distal
+    hip_px = point_to_pixel(leg.hip, frame.shape[1], frame.shape[0])
+    knee_px = point_to_pixel(leg.knee, frame.shape[1], frame.shape[0])
+    distal_px = point_to_pixel(distal, frame.shape[1], frame.shape[0])
+
+    cv2.line(frame, hip_px, knee_px, (80, 220, 120), 4, cv2.LINE_AA)
+    cv2.line(frame, knee_px, distal_px, (80, 220, 120), 4, cv2.LINE_AA)
+    for point in (hip_px, knee_px, distal_px):
+        cv2.circle(frame, point, 6, (255, 255, 255), -1, cv2.LINE_AA)
+
+    horizontal_sign = 1.0 if distal[0] >= leg.hip[0] else -1.0
+    target_radians = math.radians(max(0.0, target_angle_degrees))
+    target_unit = np.array(
+        [horizontal_sign * math.cos(target_radians), -math.sin(target_radians)],
+        dtype=np.float32,
+    )
+    target_endpoint = leg.hip + target_unit * leg.leg_length
+    target_px = point_to_pixel(target_endpoint, frame.shape[1], frame.shape[0])
+    draw_dashed_line(frame, hip_px, target_px, (0, 230, 255), thickness=3)
+
+    if (
+        stage in ("raise", "hold")
+        and current_angle_degrees is not None
+        and current_angle_degrees < target_angle_degrees * 0.95
+    ):
+        cv2.arrowedLine(
+            frame,
+            distal_px,
+            target_px,
+            (0, 255, 170),
+            4,
+            cv2.LINE_AA,
+            tipLength=0.22,
+        )
+
+    if not knee_straight and stage != "return":
+        draw_knee_extension_arrow(frame, leg)
 
 
 def draw_flexion_guides(
@@ -1983,22 +2058,42 @@ def draw_extended_line(
     cv2.line(frame, tuple(start.astype(int)), tuple(end.astype(int)), color, thickness)
 
 
-def draw_leg(frame: np.ndarray, leg: LegPoints | None) -> None:
+def draw_leg(
+    frame: np.ndarray,
+    leg: LegPoints | None,
+    *,
+    draw_thigh: bool = True,
+    draw_shank: bool = True,
+    draw_foot: bool = False,
+) -> None:
     if leg is None:
         return
 
-    points = [leg.hip, leg.knee, leg.distal, leg.ankle, leg.heel, leg.foot_index]
-    lines = [(leg.hip, leg.knee), (leg.knee, leg.distal)]
-    if leg.ankle_visible and leg.heel is not None:
+    points: list[np.ndarray | None] = []
+    lines = []
+    if draw_thigh:
+        lines.append((leg.hip, leg.knee))
+        points.extend([leg.hip, leg.knee])
+    if draw_shank:
+        lines.append((leg.knee, leg.distal))
+        points.extend([leg.knee, leg.distal])
+    if draw_foot and leg.ankle_visible and leg.heel is not None:
         lines.append((leg.ankle, leg.heel))
-    if leg.heel is not None and leg.foot_index is not None:
+        points.extend([leg.ankle, leg.heel])
+    if draw_foot and leg.heel is not None and leg.foot_index is not None:
         lines.append((leg.heel, leg.foot_index))
+        points.extend([leg.heel, leg.foot_index])
 
     for start, end in lines:
         cv2.line(frame, tuple(start.astype(int)), tuple(end.astype(int)), (80, 220, 120), 4)
+    drawn_points: set[tuple[int, int]] = set()
     for point in points:
         if point is not None:
-            cv2.circle(frame, tuple(point.astype(int)), 6, (255, 255, 255), -1)
+            point_px = tuple(point.astype(int))
+            if point_px in drawn_points:
+                continue
+            drawn_points.add(point_px)
+            cv2.circle(frame, point_px, 6, (255, 255, 255), -1)
 
 
 def draw_visual_guides(
@@ -2186,7 +2281,6 @@ def live_preview_until_voice_done(
     feedback: str,
     extra_lines: list[str] | None = None,
     mirror: bool,
-    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> str | None:
     while speaker.is_busy() and not stop_requested():
         camera_frame = read_camera_frame(cap)
@@ -2204,8 +2298,6 @@ def live_preview_until_voice_done(
             feedback=feedback,
             extra_lines=extra_lines or ["阶段：语音提示", "画面持续刷新中"],
         )
-        if screenshot_recorder is not None:
-            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         key_action = handle_common_keys(poll_training_key(1))
         if key_action in ("quit", "skip"):
@@ -2225,7 +2317,6 @@ def speak_with_live_preview(
     text: str,
     feedback: str,
     mirror: bool,
-    screenshot_recorder: ScreenshotRecorder | None = None,
     extra_lines: list[str] | None = None,
 ) -> str | None:
     speaker.speak(text)
@@ -2240,7 +2331,6 @@ def speak_with_live_preview(
         feedback=feedback,
         extra_lines=extra_lines,
         mirror=mirror,
-        screenshot_recorder=screenshot_recorder,
     )
 
 
@@ -2256,7 +2346,6 @@ def run_timer_exercise(
     side: str,
     mirror: bool,
     reaction_seconds: float,
-    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> ExerciseRuntimeResult:
     instruction_start = time.monotonic()
     completed = 0
@@ -2382,7 +2471,13 @@ def run_timer_exercise(
                 tracked_leg_visible = raw_leg is not None
                 smoothed_leg = leg_smoother.update(raw_leg)
                 display_leg = leg_for_display(smoothed_leg, w, mirror)
-                draw_leg(frame, display_leg)
+                draw_leg(
+                    frame,
+                    display_leg,
+                    draw_thigh=exercise.mode != "ankle_hybrid",
+                    draw_shank=exercise.mode != "ankle_hybrid",
+                    draw_foot=exercise.mode == "ankle_hybrid",
+                )
                 tracking_text = tracked_leg_label(smoothed_leg)
                 if smoothed_leg is not None:
                     knee_angle = angle_at(smoothed_leg.hip, smoothed_leg.knee, smoothed_leg.distal)
@@ -2450,8 +2545,6 @@ def run_timer_exercise(
 
                 if exercise.mode != "ankle_hybrid":
                     filtered_angle = None
-                    display_baseline_ankle = mirror_point_for_display(baseline_ankle, w, mirror)
-                    draw_visual_guides(frame, display_baseline_ankle, display_leg, exercise, "setup")
                     if tracked_state.locked_side:
                         frame_feedback = f"{frame_feedback} 已锁定{side_label_zh(tracked_state.locked_side)}。"
                 else:
@@ -2610,8 +2703,6 @@ def run_timer_exercise(
                 f"膝角：{knee_angle_text}" if exercise.mode == "timer" else "",
             ],
         )
-        if screenshot_recorder is not None:
-            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         key = poll_training_key(1)
 
@@ -2636,7 +2727,6 @@ def run_timer_exercise(
         feedback="本次计数完成，准备播报动作完成。",
         extra_lines=["阶段：动作完成", "画面持续刷新中"],
         mirror=mirror,
-        screenshot_recorder=screenshot_recorder,
     )
     if key_action == "quit" or stop_requested():
         return finish_result(exercise, completed, "quit", instruction_start, warnings)
@@ -2654,7 +2744,6 @@ def run_timer_exercise(
         feedback="动作完成，准备切换到下一个动作。",
         extra_lines=["阶段：动作完成", "画面持续刷新中"],
         mirror=mirror,
-        screenshot_recorder=screenshot_recorder,
     )
     if key_action == "quit" or stop_requested():
         return finish_result(exercise, completed, "quit", instruction_start, warnings)
@@ -2676,7 +2765,6 @@ def run_visual_exercise(
     mirror: bool,
     reaction_seconds: float,
     leg_length_cm: float,
-    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> ExerciseRuntimeResult:
     start = time.monotonic()
     completed = 0
@@ -2695,6 +2783,7 @@ def run_visual_exercise(
     feedback = "请先摆好起始位，让髋、膝、踝都清楚可见。"
     last_warning_time = 0.0
     last_instruction_time = 0.0
+    is_straight_leg_raise = exercise.id == "supine_straight_leg_raise"
     leg_smoother = LegSmoother(alpha=0.30, max_jump_ratio=0.22)
     tracked_state = TrackedLegState()
     displacement_smoother = ScalarSmoother(alpha=0.25, max_jump=0.10)
@@ -2746,11 +2835,16 @@ def run_visual_exercise(
             exercise,
             leg_length_cm,
         )
-        target_text = f"{target_angle_degrees:.0f} 度 / {target_distance_cm:.1f} cm"
+        target_text = (
+            f"{target_angle_degrees:.0f} 度"
+            if is_straight_leg_raise
+            else f"{target_angle_degrees:.0f} 度 / {target_distance_cm:.1f} cm"
+        )
         hold_text = "--"
         motion_metrics: VisualMotionMetrics | None = None
         raw_displacement = 0.0
         raw_movement_angle = 0.0
+        current_raise_angle: float | None = None
 
         if not result.pose_landmarks:
             leg_smoother.update(None)
@@ -2762,7 +2856,8 @@ def run_visual_exercise(
             raw_leg = pick_stable_tracked_leg(result.pose_landmarks.landmark, w, h, side, tracked_state)
             leg = leg_smoother.update(raw_leg)
             display_leg = leg_for_display(leg, w, mirror)
-            draw_leg(frame, display_leg)
+            if not is_straight_leg_raise:
+                draw_leg(frame, display_leg, draw_thigh=True, draw_shank=True, draw_foot=False)
             tracking_text = tracked_leg_label(leg)
 
             if leg is None:
@@ -2772,6 +2867,12 @@ def run_visual_exercise(
                 knee_angle = knee_angle_smoother.update(knee_extension_angle(leg)) or 0.0
                 knee_line_ratio = knee_line_smoother.update(knee_line_deviation_ratio(leg)) or 0.0
                 current_angle_text = f"{knee_angle:.0f} 度 / 偏移 {knee_line_ratio:.2f}"
+                if is_straight_leg_raise:
+                    current_raise_angle = (
+                        movement_angle_smoother.update(straight_leg_raise_angle_degrees(leg)) or 0.0
+                    )
+                    raw_movement_angle = current_raise_angle
+                    movement_angle_text = f"{current_raise_angle:.0f} / {target_angle_degrees:.0f} 度"
                 knee_bent_candidate = knee_line_ratio > VISUAL_KNEE_LINE_MAX_RATIO
                 if knee_bent_candidate:
                     if knee_bent_started_at is None:
@@ -2793,7 +2894,8 @@ def run_visual_exercise(
                     )
                     if raw_motion_metrics is not None:
                         raw_displacement = raw_motion_metrics.movement_ratio
-                        raw_movement_angle = raw_motion_metrics.angle_degrees
+                        if not is_straight_leg_raise:
+                            raw_movement_angle = raw_motion_metrics.angle_degrees
                     motion_metrics = smooth_visual_metrics(
                         raw_motion_metrics,
                         ratio_smoother=displacement_smoother,
@@ -2802,18 +2904,20 @@ def run_visual_exercise(
                     )
                     if motion_metrics is not None:
                         displacement = motion_metrics.movement_ratio
-                        movement_angle_text = (
-                            f"{motion_metrics.angle_degrees:.0f} / "
-                            f"{motion_metrics.target_angle_degrees:.0f} 度"
-                        )
-                        distance_text = (
-                            f"{motion_metrics.distance_cm:.1f} / "
-                            f"{motion_metrics.target_distance_cm:.1f} cm"
-                        )
+                        if not is_straight_leg_raise:
+                            movement_angle_text = (
+                                f"{motion_metrics.angle_degrees:.0f} / "
+                                f"{motion_metrics.target_angle_degrees:.0f} 度"
+                            )
+                            distance_text = (
+                                f"{motion_metrics.distance_cm:.1f} / "
+                                f"{motion_metrics.target_distance_cm:.1f} cm"
+                            )
                     else:
                         raw_displacement = relative_ankle_displacement(leg, baseline_ankle, baseline_hip)
                         displacement = displacement_smoother.update(raw_displacement) or raw_displacement
-                        raw_movement_angle = 0.0
+                        if not is_straight_leg_raise:
+                            raw_movement_angle = 0.0
                 else:
                     displacement = 0.0
                     reset_motion_smoothers()
@@ -2821,15 +2925,25 @@ def run_visual_exercise(
                 display_baseline_ankle = mirror_point_for_display(baseline_ankle, w, mirror)
                 display_baseline_hip = mirror_point_for_display(baseline_hip, w, mirror)
                 display_metrics = visual_metrics_for_display(motion_metrics, w, mirror)
-                draw_visual_guides(
-                    frame,
-                    display_baseline_ankle,
-                    display_leg,
-                    exercise,
-                    stage,
-                    display_baseline_hip,
-                    display_metrics,
-                )
+                if is_straight_leg_raise:
+                    draw_straight_leg_raise_guides(
+                        frame,
+                        display_leg,
+                        target_angle_degrees=target_angle_degrees,
+                        current_angle_degrees=current_raise_angle,
+                        knee_straight=knee_straight,
+                        stage=stage,
+                    )
+                else:
+                    draw_visual_guides(
+                        frame,
+                        display_baseline_ankle,
+                        display_leg,
+                        exercise,
+                        stage,
+                        display_baseline_hip,
+                        display_metrics,
+                    )
 
                 if voice_gate.blocks_logic:
                     feedback = voice_gate.feedback
@@ -2888,11 +3002,17 @@ def run_visual_exercise(
                             feedback = "请先稳定起始位，不要急着抬。"
 
                     elif stage == "raise":
-                        target_reached = (
-                            motion_metrics.target_reached
-                            if motion_metrics is not None
-                            else displacement >= target_ratio
-                        )
+                        if is_straight_leg_raise:
+                            target_reached = (
+                                current_raise_angle is not None
+                                and current_raise_angle >= target_angle_degrees * 0.95
+                            )
+                        else:
+                            target_reached = (
+                                motion_metrics.target_reached
+                                if motion_metrics is not None
+                                else displacement >= target_ratio
+                            )
                         if target_reached:
                             if target_reached_started_at is None:
                                 target_reached_started_at = now
@@ -2933,12 +3053,21 @@ def run_visual_exercise(
                                 last_instruction_time = now
 
                     elif stage == "hold":
-                        hold_drop_threshold = (
-                            max(exercise.visual_down_threshold, motion_metrics.target_ratio * VISUAL_HOLD_DROP_RATIO)
-                            if motion_metrics is not None
-                            else max(exercise.visual_down_threshold, target_ratio * VISUAL_HOLD_DROP_RATIO)
-                        )
-                        if displacement < hold_drop_threshold:
+                        if is_straight_leg_raise:
+                            hold_drop_threshold = max(
+                                VISUAL_RETURN_MIN_ANGLE_DEGREES,
+                                target_angle_degrees * VISUAL_HOLD_DROP_RATIO,
+                            )
+                            hold_dropped = current_raise_angle is None or current_raise_angle < hold_drop_threshold
+                        else:
+                            hold_drop_threshold = (
+                                max(exercise.visual_down_threshold, motion_metrics.target_ratio * VISUAL_HOLD_DROP_RATIO)
+                                if motion_metrics is not None
+                                else max(exercise.visual_down_threshold, target_ratio * VISUAL_HOLD_DROP_RATIO)
+                            )
+                            hold_dropped = displacement < hold_drop_threshold
+
+                        if hold_dropped:
                             if hold_drop_started_at is None:
                                 hold_drop_started_at = now
                             drop_seconds = now - hold_drop_started_at
@@ -2957,18 +3086,26 @@ def run_visual_exercise(
                                 feedback = "检测到短暂偏低，请抬回目标线。"
                         else:
                             hold_drop_started_at = None
-                            hold_threshold = (
-                                motion_metrics.target_ratio * 0.85
-                                if motion_metrics is not None
-                                else target_ratio * 0.85
-                            )
+                            if is_straight_leg_raise:
+                                hold_threshold = target_angle_degrees * 0.85
+                                below_hold_threshold = (
+                                    current_raise_angle is not None
+                                    and current_raise_angle < hold_threshold
+                                )
+                            else:
+                                hold_threshold = (
+                                    motion_metrics.target_ratio * 0.85
+                                    if motion_metrics is not None
+                                    else target_ratio * 0.85
+                                )
+                                below_hold_threshold = displacement < hold_threshold
                             if standard_started_at is None:
                                 standard_started_at = time.monotonic()
                             now = time.monotonic()
                             held_seconds = now - standard_started_at
                             hold_text = f"{held_seconds:.1f}/{exercise.target_hold_seconds:.1f} 秒"
                             remaining = max(0.0, exercise.target_hold_seconds - held_seconds)
-                            if displacement < hold_threshold:
+                            if below_hold_threshold:
                                 feedback = f"接近目标线，继续保持，还需 {remaining:.1f} 秒。"
                             else:
                                 feedback = f"标准位保持中，还需 {remaining:.1f} 秒。"
@@ -2993,30 +3130,36 @@ def run_visual_exercise(
                                 feedback = "听口令，口令结束后慢慢放下。"
 
                     elif stage == "return":
-                        return_ratio_threshold = (
-                            max(
-                                exercise.visual_down_threshold * VISUAL_RETURN_RATIO_MULTIPLIER,
-                                (motion_metrics.target_ratio if motion_metrics is not None else target_ratio)
-                                * VISUAL_RETURN_RATIO_FRACTION,
-                            )
-                        )
                         return_angle_threshold = max(
                             VISUAL_RETURN_MIN_ANGLE_DEGREES,
                             (motion_metrics.target_angle_degrees if motion_metrics is not None else target_angle_degrees)
                             * VISUAL_RETURN_ANGLE_FRACTION,
                         )
-                        return_ready = (
-                            displacement <= return_ratio_threshold
-                            or raw_displacement <= exercise.visual_down_threshold
-                            or (
-                                raw_movement_angle > 0.0
-                                and raw_movement_angle <= return_angle_threshold
+                        if is_straight_leg_raise:
+                            return_ready = (
+                                current_raise_angle is not None
+                                and current_raise_angle <= return_angle_threshold
                             )
-                            or (
-                                motion_metrics is not None
-                                and motion_metrics.angle_degrees <= return_angle_threshold
+                        else:
+                            return_ratio_threshold = (
+                                max(
+                                    exercise.visual_down_threshold * VISUAL_RETURN_RATIO_MULTIPLIER,
+                                    (motion_metrics.target_ratio if motion_metrics is not None else target_ratio)
+                                    * VISUAL_RETURN_RATIO_FRACTION,
+                                )
                             )
-                        )
+                            return_ready = (
+                                displacement <= return_ratio_threshold
+                                or raw_displacement <= exercise.visual_down_threshold
+                                or (
+                                    raw_movement_angle > 0.0
+                                    and raw_movement_angle <= return_angle_threshold
+                                )
+                                or (
+                                    motion_metrics is not None
+                                    and motion_metrics.angle_degrees <= return_angle_threshold
+                                )
+                            )
                         if return_ready:
                             if return_started_at is None:
                                 return_started_at = now
@@ -3053,11 +3196,19 @@ def run_visual_exercise(
                                     speaker.speak(f"完成 {completed} 次。")
                         else:
                             return_started_at = None
-                            feedback = (
-                                "慢慢放回起始位。"
-                                f"当前离床约 {displacement * leg_length_cm:.1f} 厘米，"
-                                f"目标小于 {return_ratio_threshold * leg_length_cm:.1f} 厘米。"
-                            )
+                            if is_straight_leg_raise:
+                                angle_for_feedback = 0.0 if current_raise_angle is None else current_raise_angle
+                                feedback = (
+                                    "慢慢放回起始位。"
+                                    f"当前抬高约 {angle_for_feedback:.0f} 度，"
+                                    f"目标小于 {return_angle_threshold:.0f} 度。"
+                                )
+                            else:
+                                feedback = (
+                                    "慢慢放回起始位。"
+                                    f"当前离床约 {displacement * leg_length_cm:.1f} 厘米，"
+                                    f"目标小于 {return_ratio_threshold * leg_length_cm:.1f} 厘米。"
+                                )
 
         stage_text = {
             "setup": "起始位确认",
@@ -3065,6 +3216,18 @@ def run_visual_exercise(
             "hold": "标准位保持",
             "return": "控制放回",
         }[stage]
+        extra_lines = [
+            f"阶段：{stage_text}",
+            tracking_text,
+            view_text,
+            f"膝关节内角：{current_angle_text}",
+            f"抬高角：{movement_angle_text}",
+            f"目标：{target_text}",
+            f"保持时间：{hold_text}",
+            "按 r 可重置起始位",
+        ]
+        if not is_straight_leg_raise:
+            extra_lines.insert(5, f"离床距离：{distance_text}")
         frame = render_training_frame(
             renderer=renderer,
             frame=frame,
@@ -3073,20 +3236,8 @@ def run_visual_exercise(
             total_exercises=total_exercises,
             completed=completed,
             feedback=feedback,
-            extra_lines=[
-                f"阶段：{stage_text}",
-                tracking_text,
-                view_text,
-                f"膝关节内角：{current_angle_text}",
-                f"抬高角：{movement_angle_text}",
-                f"离床距离：{distance_text}",
-                f"目标：{target_text}",
-                f"保持时间：{hold_text}",
-                "按 r 可重置起始位",
-            ],
+            extra_lines=extra_lines,
         )
-        if screenshot_recorder is not None:
-            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
@@ -3128,7 +3279,6 @@ def run_visual_exercise(
         feedback="本次计数完成，准备播报动作完成。",
         extra_lines=["阶段：动作完成", "画面持续刷新中"],
         mirror=mirror,
-        screenshot_recorder=screenshot_recorder,
     )
     if key_action == "quit" or stop_requested():
         return finish_result(exercise, completed, "quit", start, warnings)
@@ -3146,7 +3296,6 @@ def run_visual_exercise(
         feedback="动作完成，准备切换到下一个动作。",
         extra_lines=["阶段：动作完成", "画面持续刷新中"],
         mirror=mirror,
-        screenshot_recorder=screenshot_recorder,
     )
     if key_action == "quit" or stop_requested():
         return finish_result(exercise, completed, "quit", start, warnings)
@@ -3167,7 +3316,6 @@ def run_flexion_visual_exercise(
     side: str,
     mirror: bool,
     reaction_seconds: float,
-    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> ExerciseRuntimeResult:
     start = time.monotonic()
     completed = 0
@@ -3493,8 +3641,6 @@ def run_flexion_visual_exercise(
                 "按 r 可重置起始位",
             ],
         )
-        if screenshot_recorder is not None:
-            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
@@ -3534,7 +3680,6 @@ def run_flexion_visual_exercise(
         feedback="本次计数完成，准备播报动作完成。",
         extra_lines=["阶段：动作完成", "画面持续刷新中"],
         mirror=mirror,
-        screenshot_recorder=screenshot_recorder,
     )
     if key_action == "quit" or stop_requested():
         return finish_result(exercise, completed, "quit", start, warnings)
@@ -3552,7 +3697,6 @@ def run_flexion_visual_exercise(
         feedback="动作完成，准备切换到下一个动作。",
         extra_lines=["阶段：动作完成", "画面持续刷新中"],
         mirror=mirror,
-        screenshot_recorder=screenshot_recorder,
     )
     if key_action == "quit" or stop_requested():
         return finish_result(exercise, completed, "quit", start, warnings)
@@ -3653,7 +3797,8 @@ def create_session_output_dir() -> Path:
     return output_dir
 
 
-def save_results(results: list[ExerciseRuntimeResult], output_dir: Path) -> Path:
+def save_results(results: list[ExerciseRuntimeResult]) -> Path:
+    output_dir = create_session_output_dir()
     output_path = output_dir / "summary.json"
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -3691,7 +3836,6 @@ def show_summary_until_quit(
     results: list[ExerciseRuntimeResult],
     result_path: Path,
     mirror: bool,
-    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> None:
     while not stop_requested():
         frame = read_camera_frame(cap)
@@ -3700,8 +3844,6 @@ def show_summary_until_quit(
         elif mirror:
             frame = cv2.flip(frame, 1)
         frame = render_summary_frame(renderer, frame, results, result_path)
-        if screenshot_recorder is not None:
-            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         if poll_training_key(30) == ord("q"):
             break
@@ -3867,9 +4009,6 @@ def main() -> None:
     ACTIVE_SPEAKER = speaker
     cap: cv2.VideoCapture | None = None
     results: list[ExerciseRuntimeResult] = []
-    session_output_dir = create_session_output_dir()
-    screenshot_recorder = ScreenshotRecorder(session_output_dir)
-    print(f"本次训练记录目录：{session_output_dir}")
 
     try:
         try:
@@ -3911,7 +4050,6 @@ def main() -> None:
                         side=args.side,
                         mirror=not args.no_mirror,
                         reaction_seconds=reaction_seconds,
-                        screenshot_recorder=screenshot_recorder,
                     )
                 elif exercise.mode == "flexion_visual":
                     result = run_flexion_visual_exercise(
@@ -3925,7 +4063,6 @@ def main() -> None:
                         side=args.side,
                         mirror=not args.no_mirror,
                         reaction_seconds=reaction_seconds,
-                        screenshot_recorder=screenshot_recorder,
                     )
                 else:
                     result = run_visual_exercise(
@@ -3940,7 +4077,6 @@ def main() -> None:
                         mirror=not args.no_mirror,
                         reaction_seconds=reaction_seconds,
                         leg_length_cm=leg_length_cm,
-                        screenshot_recorder=screenshot_recorder,
                     )
 
                 results.append(result)
@@ -3949,7 +4085,7 @@ def main() -> None:
 
         if not results and stop_requested():
             return
-        result_path = save_results(results, session_output_dir)
+        result_path = save_results(results)
         print_summary(results, result_path)
         if not stop_requested():
             speaker.speak_and_wait("训练完成。")
@@ -3959,7 +4095,6 @@ def main() -> None:
                 results,
                 result_path,
                 mirror=not args.no_mirror,
-                screenshot_recorder=screenshot_recorder,
             )
 
     finally:
