@@ -31,7 +31,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 import cv2
 import mediapipe as mp
@@ -109,6 +109,8 @@ INTERRUPT_POLL_SECONDS = 0.03
 CAMERA_READ_RETRY_ATTEMPTS = 3
 CAMERA_READ_RETRY_SLEEP_SECONDS = 0.03
 CAMERA_READ_MAX_CONSECUTIVE_FAILURES = 30
+SCREENSHOT_INTERVAL_SECONDS = 5.0
+SCREENSHOT_JPEG_QUALITY = 92
 SAPI_SPEAK_ASYNC = 1
 SAPI_PURGE_BEFORE_SPEAK = 2
 
@@ -222,6 +224,32 @@ class TrackedLegState:
         self.locked_distal_part = None
         self.distal_candidate = None
         self.distal_candidate_frames = 0
+
+
+@dataclass
+class ScreenshotRecorder:
+    output_dir: Path
+    interval_seconds: float = SCREENSHOT_INTERVAL_SECONDS
+    last_saved_at: float = field(default=0.0, init=False)
+    saved_count: int = field(default=0, init=False)
+
+    def maybe_save(self, frame: np.ndarray) -> None:
+        now = time.monotonic()
+        if self.last_saved_at and now - self.last_saved_at < self.interval_seconds:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        output_path = self.output_dir / f"screen_{timestamp}.jpg"
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, SCREENSHOT_JPEG_QUALITY],
+        )
+        if not ok:
+            return
+        encoded.tofile(str(output_path))
+        self.last_saved_at = now
+        self.saved_count += 1
 
 
 def edge_tts_is_available() -> bool:
@@ -668,6 +696,106 @@ class Speaker:
         self.stop()
 
 
+@dataclass
+class VoiceGate:
+    speaker: Speaker
+    text: str | None = None
+    started_at: float = 0.0
+    speech_finished_at: float | None = None
+    reaction_seconds: float = 0.0
+    callback: Callable[[], None] | None = None
+    feedback: str = "听口令，口令结束后继续。"
+    blocks_logic: bool = False
+
+    @property
+    def active(self) -> bool:
+        return self.text is not None
+
+    def start(
+        self,
+        text: str,
+        *,
+        reaction_seconds: float = 0.0,
+        callback: Callable[[], None] | None = None,
+        feedback: str = "听口令，口令结束后继续。",
+        blocks_logic: bool = True,
+        interrupt: bool = True,
+    ) -> None:
+        self.speaker.speak(text, interrupt=interrupt)
+        self.text = sanitize_voice_text(text)
+        self.started_at = time.monotonic()
+        self.speech_finished_at = None
+        self.reaction_seconds = max(0.0, reaction_seconds)
+        self.callback = callback
+        self.feedback = feedback
+        self.blocks_logic = blocks_logic
+
+    def update(self) -> bool:
+        if not self.active:
+            return False
+
+        now = time.monotonic()
+        if self.speaker.is_busy():
+            return False
+
+        if self.speech_finished_at is None:
+            self.speech_finished_at = now
+
+        if now - self.speech_finished_at < self.reaction_seconds:
+            return False
+
+        callback = self.callback
+        self.clear()
+        if callback is not None:
+            callback()
+        return True
+
+    def clear(self) -> None:
+        self.text = None
+        self.started_at = 0.0
+        self.speech_finished_at = None
+        self.reaction_seconds = 0.0
+        self.callback = None
+        self.feedback = "听口令，口令结束后继续。"
+        self.blocks_logic = False
+
+    def cancel(self, *, stop_voice: bool = False) -> None:
+        if stop_voice:
+            self.speaker.stop()
+        self.clear()
+
+
+def start_voice_sequence(
+    voice_gate: VoiceGate,
+    steps: list[tuple[str, float]] | tuple[tuple[str, float], ...],
+    *,
+    final_callback: Callable[[], None] | None = None,
+    feedback: str = "听口令，口令结束后继续。",
+    blocks_logic: bool = True,
+    interrupt: bool = True,
+) -> None:
+    queue = deque(steps)
+
+    def play_next() -> None:
+        if stop_requested():
+            return
+        if not queue:
+            if final_callback is not None:
+                final_callback()
+            return
+        text, reaction_seconds = queue.popleft()
+        voice_gate.start(
+            text,
+            reaction_seconds=reaction_seconds,
+            callback=play_next,
+            feedback=feedback,
+            blocks_logic=blocks_logic,
+            interrupt=interrupt,
+        )
+
+    play_next()
+
+
 class TextRenderer:
     def __init__(self) -> None:
         self.font_cache: dict[int, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
@@ -1023,10 +1151,18 @@ def leg_landmark_types(side: str) -> dict[str, object]:
     }
 
 
+def side_label_zh(side: str | None, *, suffix: str = "侧") -> str:
+    if side == "left":
+        return f"左{suffix}"
+    if side == "right":
+        return f"右{suffix}"
+    return "--"
+
+
 def tracked_leg_label(leg: LegPoints | None) -> str:
     if leg is None:
         return "追踪：--"
-    side_label = "左腿" if leg.side == "left" else "右腿"
+    side_label = side_label_zh(leg.side, suffix="腿")
     distal_label = {
         "ankle": "踝",
         "heel": "足跟",
@@ -2038,6 +2174,76 @@ def poll_training_key(delay_ms: int = 1) -> int:
     return key
 
 
+def live_preview_until_voice_done(
+    *,
+    cap: cv2.VideoCapture,
+    renderer: TextRenderer,
+    speaker: Speaker,
+    exercise: Exercise,
+    exercise_index: int,
+    total_exercises: int,
+    completed: int,
+    feedback: str,
+    extra_lines: list[str] | None = None,
+    mirror: bool,
+    screenshot_recorder: ScreenshotRecorder | None = None,
+) -> str | None:
+    while speaker.is_busy() and not stop_requested():
+        camera_frame = read_camera_frame(cap)
+        if camera_frame is None:
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        else:
+            frame = display_frame_for(camera_frame, mirror)
+        frame = render_training_frame(
+            renderer=renderer,
+            frame=frame,
+            exercise=exercise,
+            exercise_index=exercise_index,
+            total_exercises=total_exercises,
+            completed=completed,
+            feedback=feedback,
+            extra_lines=extra_lines or ["阶段：语音提示", "画面持续刷新中"],
+        )
+        if screenshot_recorder is not None:
+            screenshot_recorder.maybe_save(frame)
+        cv2.imshow(WINDOW_NAME, frame)
+        key_action = handle_common_keys(poll_training_key(1))
+        if key_action in ("quit", "skip"):
+            return key_action
+    return "quit" if stop_requested() else None
+
+
+def speak_with_live_preview(
+    *,
+    cap: cv2.VideoCapture,
+    renderer: TextRenderer,
+    speaker: Speaker,
+    exercise: Exercise,
+    exercise_index: int,
+    total_exercises: int,
+    completed: int,
+    text: str,
+    feedback: str,
+    mirror: bool,
+    screenshot_recorder: ScreenshotRecorder | None = None,
+    extra_lines: list[str] | None = None,
+) -> str | None:
+    speaker.speak(text)
+    return live_preview_until_voice_done(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        feedback=feedback,
+        extra_lines=extra_lines,
+        mirror=mirror,
+        screenshot_recorder=screenshot_recorder,
+    )
+
+
 def run_timer_exercise(
     *,
     cap: cv2.VideoCapture,
@@ -2050,6 +2256,7 @@ def run_timer_exercise(
     side: str,
     mirror: bool,
     reaction_seconds: float,
+    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> ExerciseRuntimeResult:
     instruction_start = time.monotonic()
     completed = 0
@@ -2088,12 +2295,20 @@ def run_timer_exercise(
     visibility_pause_spoken = False
     visibility_was_paused = False
     consecutive_camera_failures = 0
+    voice_gate = VoiceGate(speaker)
 
-    speaker.speak_and_wait(f"{exercise.name}。")
-    if exercise.mode == "ankle_hybrid":
-        speaker.speak("脚尖露出来。")
-    elif exercise.mode == "timer":
-        speaker.speak("摆好姿势。")
+    def speak_setup_prompt() -> None:
+        if exercise.mode == "ankle_hybrid":
+            speaker.speak("脚尖露出来。", interrupt=False)
+        elif exercise.mode == "timer":
+            speaker.speak("摆好姿势。", interrupt=False)
+
+    voice_gate.start(
+        f"{exercise.name}。",
+        callback=speak_setup_prompt,
+        feedback="正在播报动作名称，请摆好姿势。",
+        blocks_logic=False,
+    )
 
     def start_current_phase() -> None:
         nonlocal phase_started_at, phase_text, phase_waiting_for_voice, visibility_cue_pending
@@ -2154,6 +2369,7 @@ def run_timer_exercise(
         frame = display_frame_for(camera_frame, mirror)
 
         now = time.monotonic()
+        voice_gate.update()
         tracked_leg_visible = False
 
         if exercise.mode in ("ankle_hybrid", "timer"):
@@ -2211,19 +2427,33 @@ def run_timer_exercise(
                                 )
                             else:
                                 frame_feedback = f"起始位稳定中 {stable_seconds:.1f}/{ISOMETRIC_START_HOLD_SECONDS:.1f} 秒。"
-                            if stable_seconds >= ISOMETRIC_START_HOLD_SECONDS and not started:
-                                speaker.speak_and_wait("准备，开始。", reaction_seconds=reaction_seconds)
-                                if stop_requested():
-                                    return finish_result(exercise, completed, "quit", instruction_start, warnings)
-                                started = True
-                                start_current_phase()
+                            if (
+                                stable_seconds >= ISOMETRIC_START_HOLD_SECONDS
+                                and not started
+                                and not voice_gate.blocks_logic
+                            ):
+                                def begin_timer_training() -> None:
+                                    nonlocal started
+                                    if stop_requested():
+                                        return
+                                    started = True
+                                    start_current_phase()
+
+                                voice_gate.start(
+                                    "准备，开始。",
+                                    reaction_seconds=reaction_seconds,
+                                    callback=begin_timer_training,
+                                    feedback="听口令，口令结束后开始计时。",
+                                    blocks_logic=True,
+                                )
+                                frame_feedback = "听口令，口令结束后开始计时。"
 
                 if exercise.mode != "ankle_hybrid":
                     filtered_angle = None
                     display_baseline_ankle = mirror_point_for_display(baseline_ankle, w, mirror)
                     draw_visual_guides(frame, display_baseline_ankle, display_leg, exercise, "setup")
                     if tracked_state.locked_side:
-                        frame_feedback = f"{frame_feedback} 已锁定{tracked_state.locked_side}侧。"
+                        frame_feedback = f"{frame_feedback} 已锁定{side_label_zh(tracked_state.locked_side)}。"
                 else:
                     filtered_angle = ankle_filter.update(ankle_foot_angle(smoothed_leg) if smoothed_leg else None)
                 if filtered_angle is None:
@@ -2238,11 +2468,26 @@ def run_timer_exercise(
                     update_ankle_cycle_angle(filtered_angle)
                     if not started:
                         frame_feedback = "足踝已识别，保持起始位。"
-                        if ready_stable_frames >= ANKLE_READY_STABLE_FRAMES:
-                            speaker.speak_and_wait("准备，开始。", reaction_seconds=reaction_seconds)
-                            started = True
-                            start_current_phase()
-                            frame_feedback = "跟随节拍做踝泵。"
+                        if (
+                            ready_stable_frames >= ANKLE_READY_STABLE_FRAMES
+                            and not voice_gate.blocks_logic
+                        ):
+                            def begin_ankle_training() -> None:
+                                nonlocal started, frame_feedback
+                                if stop_requested():
+                                    return
+                                started = True
+                                start_current_phase()
+                                frame_feedback = "跟随节拍做踝泵。"
+
+                            voice_gate.start(
+                                "准备，开始。",
+                                reaction_seconds=reaction_seconds,
+                                callback=begin_ankle_training,
+                                feedback="听口令，口令结束后开始踝泵。",
+                                blocks_logic=True,
+                            )
+                            frame_feedback = "听口令，口令结束后开始踝泵。"
             else:
                 ready_stable_frames = 0
                 leg_smoother.update(None)
@@ -2340,6 +2585,10 @@ def run_timer_exercise(
                 frame_feedback = "按节拍完成。"
             elapsed_training = active_timer_seconds()
 
+        if voice_gate.blocks_logic:
+            frame_feedback = voice_gate.feedback
+            elapsed_training = active_timer_seconds()
+
         frame = render_training_frame(
             renderer=renderer,
             frame=frame,
@@ -2361,6 +2610,8 @@ def run_timer_exercise(
                 f"膝角：{knee_angle_text}" if exercise.mode == "timer" else "",
             ],
         )
+        if screenshot_recorder is not None:
+            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         key = poll_training_key(1)
 
@@ -2374,7 +2625,41 @@ def run_timer_exercise(
         return finish_result(exercise, completed, "quit", instruction_start, warnings)
     if exercise.mode == "ankle_hybrid" and completed > 0 and visual_confirmed_cycles == 0:
         add_warning(warnings, "踝泵视觉幅度未稳定确认")
-    speaker.speak_and_wait(f"{exercise.name}完成。")
+    key_action = live_preview_until_voice_done(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        feedback="本次计数完成，准备播报动作完成。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+        screenshot_recorder=screenshot_recorder,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_result(exercise, completed, "quit", instruction_start, warnings)
+    if key_action == "skip":
+        return finish_result(exercise, completed, "completed", instruction_start, warnings)
+    key_action = speak_with_live_preview(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        text=f"{exercise.name}完成。",
+        feedback="动作完成，准备切换到下一个动作。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+        screenshot_recorder=screenshot_recorder,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_result(exercise, completed, "quit", instruction_start, warnings)
+    if key_action == "skip":
+        return finish_result(exercise, completed, "completed", instruction_start, warnings)
     return finish_result(exercise, completed, "completed", instruction_start, warnings)
 
 
@@ -2391,6 +2676,7 @@ def run_visual_exercise(
     mirror: bool,
     reaction_seconds: float,
     leg_length_cm: float,
+    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> ExerciseRuntimeResult:
     start = time.monotonic()
     completed = 0
@@ -2417,6 +2703,7 @@ def run_visual_exercise(
     movement_angle_smoother = ScalarSmoother(alpha=0.25, max_jump=12.0)
     movement_distance_smoother = ScalarSmoother(alpha=0.25, max_jump=12.0)
     consecutive_camera_failures = 0
+    voice_gate = VoiceGate(speaker)
 
     def reset_motion_smoothers() -> None:
         displacement_smoother.reset()
@@ -2430,8 +2717,12 @@ def run_visual_exercise(
         baseline_knee_angle = knee_angle
         baseline_axis_unit = visual_baseline_axis_unit(leg)
 
-    speaker.speak_and_wait(f"{exercise.name}。")
-    speaker.speak("摆好姿势。")
+    voice_gate.start(
+        f"{exercise.name}。",
+        callback=lambda: speaker.speak("摆好姿势。", interrupt=False),
+        feedback="正在播报动作名称，请摆好姿势。",
+        blocks_logic=False,
+    )
 
     while completed < exercise.target_units and not stop_requested():
         camera_frame = read_camera_frame(cap)
@@ -2443,6 +2734,7 @@ def run_visual_exercise(
             continue
         consecutive_camera_failures = 0
         frame = display_frame_for(camera_frame, mirror)
+        voice_gate.update()
 
         result = detect_pose(pose, camera_frame)
         current_angle_text = "--"
@@ -2539,7 +2831,9 @@ def run_visual_exercise(
                     display_metrics,
                 )
 
-                if not knee_straight and stage != "return":
+                if voice_gate.blocks_logic:
+                    feedback = voice_gate.feedback
+                elif not knee_straight and stage != "return":
                     feedback = "膝盖偏离直线较明显，请伸直后再抬。"
                     add_warning(warnings, "膝关节未保持伸直")
                     standard_started_at = None
@@ -2561,17 +2855,32 @@ def run_visual_exercise(
                             stable_seconds = now - stage_started_at
                             hold_text = f"{stable_seconds:.1f}/{VISUAL_START_HOLD_SECONDS:.1f} 秒"
                             feedback = "起始位稳定中，保持住。"
-                            if stable_seconds >= VISUAL_START_HOLD_SECONDS:
-                                speaker.speak_and_wait("准备，开始。", reaction_seconds=reaction_seconds)
-                                speaker.speak_and_wait("抬起。")
-                                capture_visual_baseline(leg, knee_angle)
-                                reset_motion_smoothers()
-                                target_reached_started_at = None
-                                hold_drop_started_at = None
-                                stage = "raise"
-                                stage_started_at = time.monotonic()
-                                last_instruction_time = stage_started_at
-                                feedback = "起始位达标，现在慢慢抬到标准位置。"
+                            if stable_seconds >= VISUAL_START_HOLD_SECONDS and not voice_gate.blocks_logic:
+                                ready_leg = leg
+                                ready_knee_angle = knee_angle
+
+                                def begin_raise() -> None:
+                                    nonlocal stage, stage_started_at, last_instruction_time
+                                    nonlocal target_reached_started_at, hold_drop_started_at, feedback
+                                    if stop_requested():
+                                        return
+                                    capture_visual_baseline(ready_leg, ready_knee_angle)
+                                    reset_motion_smoothers()
+                                    target_reached_started_at = None
+                                    hold_drop_started_at = None
+                                    stage = "raise"
+                                    stage_started_at = time.monotonic()
+                                    last_instruction_time = stage_started_at
+                                    feedback = "起始位达标，现在慢慢抬到标准位置。"
+
+                                start_voice_sequence(
+                                    voice_gate,
+                                    (("准备，开始。", reaction_seconds), ("抬起。", 0.0)),
+                                    final_callback=begin_raise,
+                                    feedback="听口令，口令结束后开始抬起。",
+                                    blocks_logic=True,
+                                )
+                                feedback = "听口令，口令结束后开始抬起。"
                         else:
                             capture_visual_baseline(leg, knee_angle)
                             reset_motion_smoothers()
@@ -2593,14 +2902,27 @@ def run_visual_exercise(
                             target_confirm_seconds = 0.0
 
                         if target_reached and target_confirm_seconds >= VISUAL_TARGET_CONFIRM_SECONDS:
-                            speaker.speak_and_wait("保持。")
-                            stage = "hold"
-                            standard_started_at = time.monotonic()
-                            stage_started_at = standard_started_at
-                            target_reached_started_at = None
-                            hold_drop_started_at = None
-                            last_instruction_time = stage_started_at
-                            feedback = "已到标准位置，保持住。"
+                            def begin_hold() -> None:
+                                nonlocal stage, standard_started_at, stage_started_at
+                                nonlocal target_reached_started_at, hold_drop_started_at
+                                nonlocal last_instruction_time, feedback
+                                if stop_requested():
+                                    return
+                                stage = "hold"
+                                standard_started_at = time.monotonic()
+                                stage_started_at = standard_started_at
+                                target_reached_started_at = None
+                                hold_drop_started_at = None
+                                last_instruction_time = stage_started_at
+                                feedback = "已到标准位置，保持住。"
+
+                            voice_gate.start(
+                                "保持。",
+                                callback=begin_hold,
+                                feedback="听口令，口令结束后开始保持。",
+                                blocks_logic=True,
+                            )
+                            feedback = "听口令，口令结束后开始保持。"
                         else:
                             if target_reached:
                                 feedback = "已到目标线，稳定一下。"
@@ -2651,12 +2973,24 @@ def run_visual_exercise(
                             else:
                                 feedback = f"标准位保持中，还需 {remaining:.1f} 秒。"
                             if held_seconds >= exercise.target_hold_seconds:
-                                speaker.speak_and_wait("放下。")
-                                stage = "return"
-                                return_started_at = None
-                                stage_started_at = time.monotonic()
-                                hold_drop_started_at = None
-                                feedback = "保持达标，现在慢慢放回起始位。"
+                                def begin_return() -> None:
+                                    nonlocal stage, return_started_at, stage_started_at
+                                    nonlocal hold_drop_started_at, feedback
+                                    if stop_requested():
+                                        return
+                                    stage = "return"
+                                    return_started_at = None
+                                    stage_started_at = time.monotonic()
+                                    hold_drop_started_at = None
+                                    feedback = "保持达标，现在慢慢放回起始位。"
+
+                                voice_gate.start(
+                                    "放下。",
+                                    callback=begin_return,
+                                    feedback="听口令，口令结束后慢慢放下。",
+                                    blocks_logic=True,
+                                )
+                                feedback = "听口令，口令结束后慢慢放下。"
 
                     elif stage == "return":
                         return_ratio_threshold = (
@@ -2691,7 +3025,6 @@ def run_visual_exercise(
                             feedback = "已经回到起始位，保持稳定完成计数。"
                             if return_seconds >= VISUAL_RETURN_HOLD_SECONDS:
                                 completed += 1
-                                speaker.speak_and_wait(f"完成 {completed} 次。")
                                 capture_visual_baseline(leg, knee_angle)
                                 reset_motion_smoothers()
                                 standard_started_at = None
@@ -2699,10 +3032,25 @@ def run_visual_exercise(
                                 target_reached_started_at = None
                                 hold_drop_started_at = None
                                 if completed < exercise.target_units:
-                                    speaker.speak_and_wait("抬起。")
-                                    stage = "raise"
-                                    stage_started_at = time.monotonic()
-                                    feedback = "完成一次。继续下一次，慢慢抬到标准位置。"
+                                    def begin_next_raise() -> None:
+                                        nonlocal stage, stage_started_at, feedback, last_instruction_time
+                                        if stop_requested():
+                                            return
+                                        stage = "raise"
+                                        stage_started_at = time.monotonic()
+                                        last_instruction_time = stage_started_at
+                                        feedback = "完成一次。继续下一次，慢慢抬到标准位置。"
+
+                                    start_voice_sequence(
+                                        voice_gate,
+                                        ((f"完成 {completed} 次。", 0.0), ("抬起。", 0.0)),
+                                        final_callback=begin_next_raise,
+                                        feedback="本次已计数，听口令准备下一次。",
+                                        blocks_logic=True,
+                                    )
+                                    feedback = "本次已计数，听口令准备下一次。"
+                                else:
+                                    speaker.speak(f"完成 {completed} 次。")
                         else:
                             return_started_at = None
                             feedback = (
@@ -2737,6 +3085,8 @@ def run_visual_exercise(
                 "按 r 可重置起始位",
             ],
         )
+        if screenshot_recorder is not None:
+            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
@@ -2745,6 +3095,7 @@ def run_visual_exercise(
         if key_action == "skip":
             return finish_result(exercise, completed, "skipped", start, warnings)
         if key == ord("r"):
+            voice_gate.cancel(stop_voice=True)
             baseline_ankle = None
             baseline_hip = None
             baseline_knee_angle = None
@@ -2766,7 +3117,41 @@ def run_visual_exercise(
 
     if stop_requested():
         return finish_result(exercise, completed, "quit", start, warnings)
-    speaker.speak_and_wait(f"{exercise.name}完成。")
+    key_action = live_preview_until_voice_done(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        feedback="本次计数完成，准备播报动作完成。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+        screenshot_recorder=screenshot_recorder,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_result(exercise, completed, "quit", start, warnings)
+    if key_action == "skip":
+        return finish_result(exercise, completed, "completed", start, warnings)
+    key_action = speak_with_live_preview(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        text=f"{exercise.name}完成。",
+        feedback="动作完成，准备切换到下一个动作。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+        screenshot_recorder=screenshot_recorder,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_result(exercise, completed, "quit", start, warnings)
+    if key_action == "skip":
+        return finish_result(exercise, completed, "completed", start, warnings)
     return finish_result(exercise, completed, "completed", start, warnings)
 
 
@@ -2782,6 +3167,7 @@ def run_flexion_visual_exercise(
     side: str,
     mirror: bool,
     reaction_seconds: float,
+    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> ExerciseRuntimeResult:
     start = time.monotonic()
     completed = 0
@@ -2808,9 +3194,14 @@ def run_flexion_visual_exercise(
     flexion_target_started_at: float | None = None
     lift_target_started_at: float | None = None
     consecutive_camera_failures = 0
+    voice_gate = VoiceGate(speaker)
 
-    speaker.speak_and_wait(f"{exercise.name}。")
-    speaker.speak("摆好姿势。")
+    voice_gate.start(
+        f"{exercise.name}。",
+        callback=lambda: speaker.speak("摆好姿势。", interrupt=False),
+        feedback="正在播报动作名称，请摆好姿势。",
+        blocks_logic=False,
+    )
 
     while completed < exercise.target_units and not stop_requested():
         camera_frame = read_camera_frame(cap)
@@ -2822,6 +3213,7 @@ def run_flexion_visual_exercise(
             continue
         consecutive_camera_failures = 0
         frame = display_frame_for(camera_frame, mirror)
+        voice_gate.update()
 
         result = detect_pose(pose, camera_frame)
         tracking_text = "追踪：--"
@@ -2864,7 +3256,10 @@ def run_flexion_visual_exercise(
                     lift_stability.reset()
                 lift_text = f"{lift_angle:.0f}/{target_lift:.0f} 度" if needs_lift else "--"
 
-                if stage == "setup":
+                if voice_gate.blocks_logic:
+                    feedback = voice_gate.feedback
+
+                elif stage == "setup":
                     if baseline_distal is None:
                         baseline_distal = leg.distal.copy()
                         baseline_hip = leg.hip.copy()
@@ -2898,21 +3293,32 @@ def run_flexion_visual_exercise(
                         hold_text = f"{stable_seconds:.1f}/{VISUAL_START_HOLD_SECONDS:.1f} 秒"
                         feedback = "起始位稳定中，保持住。"
                         if stable_seconds >= VISUAL_START_HOLD_SECONDS:
-                            speaker.speak_and_wait("准备，开始。", reaction_seconds=reaction_seconds)
-                            if stop_requested():
-                                return finish_result(exercise, completed, "quit", start, warnings)
-                            if needs_lift:
-                                speaker.speak_and_wait("上抬。")
-                                stage = "lift"
-                                feedback = "先慢慢上抬到目标角度。"
-                            else:
-                                speaker.speak_and_wait("弯曲。")
-                                stage = "flex"
-                                feedback = "慢慢弯曲到目标角度。"
-                            stage_started_at = time.monotonic()
-                            last_instruction_time = stage_started_at
-                            flexion_target_started_at = None
-                            lift_target_started_at = None
+                            next_cue = "上抬。" if needs_lift else "弯曲。"
+
+                            def begin_flexion_motion() -> None:
+                                nonlocal stage, stage_started_at, last_instruction_time
+                                nonlocal flexion_target_started_at, lift_target_started_at, feedback
+                                if stop_requested():
+                                    return
+                                if needs_lift:
+                                    stage = "lift"
+                                    feedback = "先慢慢上抬到目标角度。"
+                                else:
+                                    stage = "flex"
+                                    feedback = "慢慢弯曲到目标角度。"
+                                stage_started_at = time.monotonic()
+                                last_instruction_time = stage_started_at
+                                flexion_target_started_at = None
+                                lift_target_started_at = None
+
+                            start_voice_sequence(
+                                voice_gate,
+                                (("准备，开始。", reaction_seconds), (next_cue, 0.0)),
+                                final_callback=begin_flexion_motion,
+                                feedback="听口令，口令结束后开始动作。",
+                                blocks_logic=True,
+                            )
+                            feedback = "听口令，口令结束后开始动作。"
 
                 elif stage == "lift":
                     if lift_angle >= target_lift * 0.95 and lift_stable:
@@ -2924,11 +3330,22 @@ def run_flexion_visual_exercise(
                         lift_ready = False
 
                     if lift_ready:
-                        speaker.speak_and_wait("弯曲。")
-                        stage = "flex"
-                        stage_started_at = time.monotonic()
-                        flexion_target_started_at = None
-                        feedback = "上抬达标，现在慢慢屈膝。"
+                        def begin_flex_after_lift() -> None:
+                            nonlocal stage, stage_started_at, flexion_target_started_at, feedback
+                            if stop_requested():
+                                return
+                            stage = "flex"
+                            stage_started_at = time.monotonic()
+                            flexion_target_started_at = None
+                            feedback = "上抬达标，现在慢慢屈膝。"
+
+                        voice_gate.start(
+                            "弯曲。",
+                            callback=begin_flex_after_lift,
+                            feedback="听口令，口令结束后开始屈膝。",
+                            blocks_logic=True,
+                        )
+                        feedback = "听口令，口令结束后开始屈膝。"
                     else:
                         feedback = "继续慢慢上抬，膝盖保持伸直。" if lift_angle < target_lift * 0.95 else "上抬角度到了，保持稳定。"
                         if flexion > FLEXION_RETURN_MAX_DEGREES:
@@ -2947,11 +3364,22 @@ def run_flexion_visual_exercise(
                         flexion_ready = False
 
                     if flexion_ready:
-                        speaker.speak_and_wait("保持。")
-                        stage = "hold"
-                        hold_started_at = time.monotonic()
-                        stage_started_at = hold_started_at
-                        feedback = "屈膝角度达标，保持住。"
+                        def begin_flexion_hold() -> None:
+                            nonlocal stage, hold_started_at, stage_started_at, feedback
+                            if stop_requested():
+                                return
+                            stage = "hold"
+                            hold_started_at = time.monotonic()
+                            stage_started_at = hold_started_at
+                            feedback = "屈膝角度达标，保持住。"
+
+                        voice_gate.start(
+                            "保持。",
+                            callback=begin_flexion_hold,
+                            feedback="听口令，口令结束后开始保持。",
+                            blocks_logic=True,
+                        )
+                        feedback = "听口令，口令结束后开始保持。"
                     else:
                         feedback = "继续慢慢弯曲，靠近黄色目标线。" if flexion < target_flexion * 0.95 else "角度到了，保持稳定。"
                         if now - last_instruction_time >= VOICE_REPEAT_SECONDS:
@@ -2973,11 +3401,22 @@ def run_flexion_visual_exercise(
                         hold_text = f"{held_seconds:.1f}/{exercise.target_hold_seconds:.1f} 秒"
                         feedback = f"保持中，还需 {max(0.0, exercise.target_hold_seconds - held_seconds):.1f} 秒。"
                         if held_seconds >= exercise.target_hold_seconds:
-                            speaker.speak_and_wait("伸直。")
-                            stage = "return"
-                            return_started_at = None
-                            stage_started_at = time.monotonic()
-                            feedback = "保持完成，慢慢伸直回到起始位。"
+                            def begin_flexion_return() -> None:
+                                nonlocal stage, return_started_at, stage_started_at, feedback
+                                if stop_requested():
+                                    return
+                                stage = "return"
+                                return_started_at = None
+                                stage_started_at = time.monotonic()
+                                feedback = "保持完成，慢慢伸直回到起始位。"
+
+                            voice_gate.start(
+                                "伸直。",
+                                callback=begin_flexion_return,
+                                feedback="听口令，口令结束后慢慢伸直。",
+                                blocks_logic=True,
+                            )
+                            feedback = "听口令，口令结束后慢慢伸直。"
 
                 elif stage == "return":
                     lift_ok = True if not needs_lift else lift_angle <= max(8.0, target_lift * 0.5)
@@ -2989,7 +3428,6 @@ def run_flexion_visual_exercise(
                         feedback = "已回到起始位，保持稳定完成计数。"
                         if return_seconds >= VISUAL_RETURN_HOLD_SECONDS:
                             completed += 1
-                            speaker.speak_and_wait(f"完成 {completed} 次。")
                             baseline_distal = leg.distal.copy()
                             baseline_hip = leg.hip.copy()
                             flexion_smoother.reset()
@@ -3001,15 +3439,31 @@ def run_flexion_visual_exercise(
                             hold_started_at = None
                             return_started_at = None
                             if completed < exercise.target_units:
-                                if needs_lift:
-                                    speaker.speak_and_wait("上抬。")
-                                    stage = "lift"
-                                    feedback = "继续下一次，先慢慢上抬。"
-                                else:
-                                    speaker.speak_and_wait("弯曲。")
-                                    stage = "flex"
-                                    feedback = "继续下一次，慢慢弯曲。"
-                                stage_started_at = time.monotonic()
+                                next_cue = "上抬。" if needs_lift else "弯曲。"
+
+                                def begin_next_flexion_rep() -> None:
+                                    nonlocal stage, stage_started_at, feedback, last_instruction_time
+                                    if stop_requested():
+                                        return
+                                    if needs_lift:
+                                        stage = "lift"
+                                        feedback = "继续下一次，先慢慢上抬。"
+                                    else:
+                                        stage = "flex"
+                                        feedback = "继续下一次，慢慢弯曲。"
+                                    stage_started_at = time.monotonic()
+                                    last_instruction_time = stage_started_at
+
+                                start_voice_sequence(
+                                    voice_gate,
+                                    ((f"完成 {completed} 次。", 0.0), (next_cue, 0.0)),
+                                    final_callback=begin_next_flexion_rep,
+                                    feedback="本次已计数，听口令准备下一次。",
+                                    blocks_logic=True,
+                                )
+                                feedback = "本次已计数，听口令准备下一次。"
+                            else:
+                                speaker.speak(f"完成 {completed} 次。")
                     else:
                         return_started_at = None
                         feedback = "慢慢伸直并回到起始位。"
@@ -3039,6 +3493,8 @@ def run_flexion_visual_exercise(
                 "按 r 可重置起始位",
             ],
         )
+        if screenshot_recorder is not None:
+            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
@@ -3047,6 +3503,7 @@ def run_flexion_visual_exercise(
         if key_action == "skip":
             return finish_result(exercise, completed, "skipped", start, warnings)
         if key == ord("r"):
+            voice_gate.cancel(stop_voice=True)
             baseline_distal = None
             baseline_hip = None
             stage = "setup"
@@ -3066,7 +3523,41 @@ def run_flexion_visual_exercise(
 
     if stop_requested():
         return finish_result(exercise, completed, "quit", start, warnings)
-    speaker.speak_and_wait(f"{exercise.name}完成。")
+    key_action = live_preview_until_voice_done(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        feedback="本次计数完成，准备播报动作完成。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+        screenshot_recorder=screenshot_recorder,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_result(exercise, completed, "quit", start, warnings)
+    if key_action == "skip":
+        return finish_result(exercise, completed, "completed", start, warnings)
+    key_action = speak_with_live_preview(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        text=f"{exercise.name}完成。",
+        feedback="动作完成，准备切换到下一个动作。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+        screenshot_recorder=screenshot_recorder,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_result(exercise, completed, "quit", start, warnings)
+    if key_action == "skip":
+        return finish_result(exercise, completed, "completed", start, warnings)
     return finish_result(exercise, completed, "completed", start, warnings)
 
 
@@ -3156,9 +3647,13 @@ def render_summary_frame(
     )
 
 
-def save_results(results: list[ExerciseRuntimeResult]) -> Path:
+def create_session_output_dir() -> Path:
     output_dir = Path("test_pose") / f"knee_desktop_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def save_results(results: list[ExerciseRuntimeResult], output_dir: Path) -> Path:
     output_path = output_dir / "summary.json"
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -3196,6 +3691,7 @@ def show_summary_until_quit(
     results: list[ExerciseRuntimeResult],
     result_path: Path,
     mirror: bool,
+    screenshot_recorder: ScreenshotRecorder | None = None,
 ) -> None:
     while not stop_requested():
         frame = read_camera_frame(cap)
@@ -3204,6 +3700,8 @@ def show_summary_until_quit(
         elif mirror:
             frame = cv2.flip(frame, 1)
         frame = render_summary_frame(renderer, frame, results, result_path)
+        if screenshot_recorder is not None:
+            screenshot_recorder.maybe_save(frame)
         cv2.imshow(WINDOW_NAME, frame)
         if poll_training_key(30) == ord("q"):
             break
@@ -3369,6 +3867,9 @@ def main() -> None:
     ACTIVE_SPEAKER = speaker
     cap: cv2.VideoCapture | None = None
     results: list[ExerciseRuntimeResult] = []
+    session_output_dir = create_session_output_dir()
+    screenshot_recorder = ScreenshotRecorder(session_output_dir)
+    print(f"本次训练记录目录：{session_output_dir}")
 
     try:
         try:
@@ -3410,6 +3911,7 @@ def main() -> None:
                         side=args.side,
                         mirror=not args.no_mirror,
                         reaction_seconds=reaction_seconds,
+                        screenshot_recorder=screenshot_recorder,
                     )
                 elif exercise.mode == "flexion_visual":
                     result = run_flexion_visual_exercise(
@@ -3423,6 +3925,7 @@ def main() -> None:
                         side=args.side,
                         mirror=not args.no_mirror,
                         reaction_seconds=reaction_seconds,
+                        screenshot_recorder=screenshot_recorder,
                     )
                 else:
                     result = run_visual_exercise(
@@ -3437,20 +3940,27 @@ def main() -> None:
                         mirror=not args.no_mirror,
                         reaction_seconds=reaction_seconds,
                         leg_length_cm=leg_length_cm,
+                        screenshot_recorder=screenshot_recorder,
                     )
 
                 results.append(result)
                 if result.status == "quit":
                     break
-                sleep_interruptible(1.0)
 
         if not results and stop_requested():
             return
-        result_path = save_results(results)
+        result_path = save_results(results, session_output_dir)
         print_summary(results, result_path)
         if not stop_requested():
             speaker.speak_and_wait("训练完成。")
-            show_summary_until_quit(cap, renderer, results, result_path, mirror=not args.no_mirror)
+            show_summary_until_quit(
+                cap,
+                renderer,
+                results,
+                result_path,
+                mirror=not args.no_mirror,
+                screenshot_recorder=screenshot_recorder,
+            )
 
     finally:
         speaker.close()
