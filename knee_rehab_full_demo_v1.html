@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>膝关节交互式康复系统 Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      --bg: #f5fbf8;
+      --ink: #073f3c;
+      --muted: #7a9490;
+      --line: #e8f2ef;
+      --lime: #d9ff67;
+      --green: #22c08a;
+      --teal: #006e71;
+      --pale: #eaffcc;
+      --card: #ffffff;
+      --shadow: 0 22px 55px rgba(0, 70, 65, 0.10);
+      --radius: 26px;
+      --danger: #cc5e5b;
+      --warn: #e0aa4f;
+      --blue: #3987e8;
+    }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at 80% 0%, #e0fff3 0, transparent 34%), var(--bg);
+    }
+    button, input, select, textarea { font-family: inherit; }
+    button { user-select: none; }
+
+    .login-screen {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 34px;
+      background: radial-gradient(circle at 8% 10%, rgba(217,255,103,0.36), transparent 28%), radial-gradient(circle at 88% 0%, rgba(16,183,143,0.24), transparent 34%), var(--bg);
+    }
+    .login-card {
+      width: min(1060px, 100%);
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      background: rgba(255,255,255,0.94);
+      border-radius: 38px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      border: 1px solid rgba(232,242,239,0.8);
+    }
+    .login-hero {
+      padding: 54px;
+      background: linear-gradient(135deg, rgba(217,255,103,0.88), rgba(16,183,143,0.86));
+      position: relative;
+      min-height: 590px;
+      color: #063e3a;
+    }
+    .login-hero h1 { font-size: 46px; line-height: 1.12; margin: 0 0 18px; letter-spacing: -1px; }
+    .login-hero p { font-size: 18px; line-height: 1.8; margin: 0; max-width: 520px; color: rgba(6,62,58,0.78); }
+    .hero-badges { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
+    .hero-badge { padding: 10px 14px; border-radius: 999px; background: rgba(255,255,255,0.48); font-weight: 800; }
+    .hero-panel {
+      position: absolute; left: 54px; right: 54px; bottom: 46px;
+      border-radius: 28px;
+      background: rgba(255,255,255,0.36);
+      backdrop-filter: blur(8px);
+      padding: 20px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .hero-stat { background: rgba(255,255,255,0.5); border-radius: 22px; padding: 16px; }
+    .hero-stat span { display: block; color: rgba(6,62,58,0.62); font-size: 13px; margin-bottom: 8px; }
+    .hero-stat strong { font-size: 25px; }
+    .login-form-wrap { padding: 48px; }
+    .login-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; background: #f2fbf8; border-radius: 20px; padding: 6px; margin-bottom: 26px; }
+    .login-tab { border: none; border-radius: 16px; height: 44px; background: transparent; color: var(--muted); font-weight: 900; cursor: pointer; }
+    .login-tab.active { background: #fff; color: var(--teal); box-shadow: 0 8px 20px rgba(0,70,65,0.06); }
+    .form-title { font-size: 30px; font-weight: 900; margin-bottom: 8px; }
+    .form-sub { color: var(--muted); line-height: 1.7; margin-bottom: 22px; }
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-weight: 800; margin-bottom: 8px; }
+    .field input, .field select {
+      width: 100%; height: 48px; border-radius: 18px; border: 1px solid var(--line); outline: none;
+      padding: 0 15px; color: var(--ink); background: #fff; font-size: 15px;
+    }
+    .login-btn { width: 100%; height: 50px; border: none; border-radius: 999px; background: linear-gradient(135deg, #d8ff67, #13be8f); color: #073f3c; font-weight: 900; cursor: pointer; box-shadow: 0 12px 26px rgba(19,190,143,0.22); margin-top: 8px; }
+    .link-btn { border: none; background: transparent; color: #0b817c; font-weight: 900; cursor: pointer; padding: 0; }
+    .demo-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 18px 0; }
+    .demo-actions button { border: 1px solid #caf3e6; border-radius: 18px; background: #e9fff7; color: #0b817c; padding: 12px 10px; font-weight: 900; cursor: pointer; }
+    .hint-box { border-radius: 18px; padding: 13px 14px; background: #f8fffc; color: var(--muted); font-size: 13px; line-height: 1.7; }
+
+    .app { width: min(1480px, 100vw); min-height: 930px; margin: 0 auto; display: none; grid-template-columns: 94px 1fr; gap: 0; padding: 34px 38px 38px 26px; }
+    .sidebar { background: rgba(255,255,255,0.82); border-radius: 34px; box-shadow: var(--shadow); display: flex; flex-direction: column; align-items: center; padding: 24px 0; gap: 22px; min-height: 850px; position: sticky; top: 28px; }
+    .logo { width: 48px; height: 48px; border-radius: 18px; background: linear-gradient(135deg, #e5ff88, #10b78f); display: grid; place-items: center; font-size: 25px; box-shadow: 0 12px 28px rgba(16,183,143,0.26); margin-bottom: 20px; user-select: none; }
+    .nav-item { width: 42px; height: 42px; border: none; border-radius: 16px; display: grid; place-items: center; color: #9ab1ad; background: transparent; font-size: 21px; position: relative; cursor: pointer; transition: 0.18s ease; }
+    .nav-item:hover { background: #f2fffb; color: #0b817c; }
+    .nav-item.active { background: #e9fff7; color: #0b817c; }
+    .nav-item.active::after { content: ""; position: absolute; right: -12px; top: 11px; height: 20px; width: 4px; border-radius: 10px; background: #14b995; }
+    .nav-spacer { flex: 1; }
+    .content { padding-left: 44px; min-width: 0; }
+    .view { display: none; }
+    .view.active { display: block; }
+
+    .header { display: grid; grid-template-columns: 1fr 390px; align-items: start; margin: 34px 0 26px; gap: 24px; }
+    h1 { margin: 0; font-size: 44px; letter-spacing: -1px; line-height: 1.12; }
+    .subtitle { margin-top: 12px; color: var(--muted); font-size: 17px; }
+    .search { background: #fff; height: 54px; border-radius: 22px; display: flex; align-items: center; padding: 0 22px; color: #9ab1ad; box-shadow: 0 14px 32px rgba(0, 60, 55, 0.06); margin-top: 4px; gap: 10px; position: relative; }
+    .search input { border: none; outline: none; width: 100%; color: var(--ink); font-size: 15px; background: transparent; }
+    .search-results { position: absolute; top: 64px; left: 0; right: 0; background: #fff; border: 1px solid var(--line); border-radius: 22px; box-shadow: var(--shadow); padding: 10px; z-index: 20; display: none; max-height: 360px; overflow: auto; }
+    .search-results.active { display: block; }
+    .search-row { width: 100%; border: none; background: #fff; padding: 12px; border-radius: 16px; display: grid; grid-template-columns: 42px 1fr; gap: 12px; text-align: left; cursor: pointer; align-items: center; }
+    .search-row:hover { background: #f7fffb; }
+    .search-row-title { font-weight: 900; margin-bottom: 4px; }
+    .search-row-sub { color: var(--muted); font-size: 12px; }
+
+    .grid { display: grid; grid-template-columns: minmax(720px, 1fr) 380px; gap: 34px; align-items: start; }
+    .history { display: flex; flex-direction: column; gap: 18px; }
+    .day-card { min-height: 120px; border: none; border-radius: var(--radius); padding: 18px 28px 18px 18px; display: grid; grid-template-columns: 82px repeat(4, minmax(116px, 1fr)); column-gap: 28px; align-items: center; color: #073f3c; box-shadow: var(--shadow); overflow: hidden; position: relative; cursor: pointer; text-align: left; transition: transform 0.18s ease, box-shadow 0.18s ease; }
+    .day-card:hover { transform: translateY(-2px); box-shadow: 0 26px 60px rgba(0, 70, 65, 0.14); }
+    .day-card::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, rgba(255,255,255,0.40), transparent 48%); pointer-events: none; }
+    .date-chip { width: 66px; height: 78px; border-radius: 18px 26px 26px 18px; background: rgba(255,255,255,0.88); color: #073f3c; display: grid; place-items: center; font-weight: 700; box-shadow: 0 12px 24px rgba(0,0,0,0.06); z-index: 1; }
+    .date-chip span { display:block; color:#8aa49f; font-weight: 600; font-size: 13px; text-align:center; }
+    .date-chip strong { display:block; font-size: 28px; line-height: 1.05; text-align:center; }
+    .metric { z-index: 1; min-width: 0; }
+    .metric .label { font-size: 15px; opacity: 0.86; margin-bottom: 8px; white-space: nowrap; }
+    .metric .value { font-size: 28px; font-weight: 900; white-space: nowrap; }
+    .metric-tip { font-size: 13px; opacity: 0.74; margin-top: 6px; white-space: nowrap; }
+
+    .panel, .soft-card { background: rgba(255,255,255,0.9); border-radius: 30px; box-shadow: var(--shadow); padding: 26px; border: 1px solid rgba(232,242,239,0.72); }
+    .panel h2, .soft-card h2 { margin: 0 0 22px; font-size: 27px; }
+    .chart-wrap { height: 230px; position: relative; }
+    .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 14px; color: var(--muted); font-size: 13px; }
+    .legend i { display: inline-block; width: 18px; height: 4px; border-radius: 99px; vertical-align: middle; margin-right: 5px; }
+    .main-l { background: #004f57; } .num-l { background: #17c291; } .quality-l { background: #d8ff67; }
+    .bottom { margin-top: 30px; display: grid; grid-template-columns: 1fr; }
+    .plan-card { background: rgba(255,255,255,0.94); border-radius: 32px; box-shadow: var(--shadow); padding: 26px 30px 30px; border: 1px solid rgba(232,242,239,0.72); }
+    .plan-head { display: grid; grid-template-columns: 1fr 300px; align-items: center; margin-bottom: 18px; }
+    .plan-head h2 { margin: 0; font-size: 30px; }
+    .progress-total { display: flex; gap: 12px; align-items: center; justify-content: flex-end; color: var(--muted); font-size: 15px; }
+    .bar-bg { width: 150px; height: 9px; border-radius: 99px; background: #e8f2ef; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #d8ff67, #10b98d); width: 56%; }
+    .plan-grid, .action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .exercise { border: 1px solid var(--line); border-radius: 24px; padding: 17px 18px; display: grid; grid-template-columns: 52px 1fr 112px; gap: 14px; align-items: center; background: linear-gradient(180deg, #ffffff, #f8fffc); min-height: 86px; }
+    .exercise.quick-start { grid-column: 1 / -1; background: linear-gradient(135deg, rgba(217,255,103,0.26), rgba(16,183,143,0.13)); }
+    .exercise .icon, .record-icon, .search-icon { width: 52px; height: 52px; border-radius: 18px; background: #e9fff7; display:grid; place-items:center; font-size: 23px; overflow: hidden; }
+    .record-icon, .search-icon { width: 42px; height: 42px; border-radius: 15px; }
+    svg.rehab-icon { width: 39px; height: 39px; display: block; overflow: visible; }
+    .rehab-icon .leg { fill: none; stroke: #006e71; stroke-width: 6.2; stroke-linecap: round; stroke-linejoin: round; }
+    .rehab-icon .bed { fill: none; stroke: #b8d7d0; stroke-width: 4.2; stroke-linecap: round; }
+    .rehab-icon .accent, .rehab-icon .press { fill: none; stroke: #20bd8f; stroke-width: 4.2; stroke-linecap: round; stroke-linejoin: round; }
+    .rehab-icon .press { stroke: #d8ff67; }
+    .rehab-icon .accent.thin { stroke-width: 3.2; }
+    .rehab-icon .dot { fill: #20bd8f; }
+    .ex-title { font-size: 18px; font-weight: 900; margin-bottom: 6px; }
+    .ex-sub { color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .btn { border: none; cursor: pointer; background: linear-gradient(135deg, #d8ff67, #13be8f); color: #073f3c; min-height: 42px; border-radius: 999px; font-weight: 900; box-shadow: 0 11px 22px rgba(19,190,143,0.22); padding: 0 16px; }
+    .btn.secondary { background: #e9fff7; color: #0b817c; box-shadow: none; border: 1px solid #caf3e6; }
+    .btn.dark { background: #093f3c; color: #fff; }
+    .btn.warn { background: #fff2e4; color: #b45e00; box-shadow: none; border: 1px solid #ffe0bd; }
+    .btn.danger { background: #fff0ef; color: #b84b49; box-shadow: none; border: 1px solid #ffd1cf; }
+
+    .page-head { margin: 34px 0 24px; display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; }
+    .page-head h1 { font-size: 42px; }
+    .page-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .back-btn, .month-btn { border: none; border-radius: 999px; background: #fff; color: #0b817c; box-shadow: 0 12px 28px rgba(0, 70, 65, 0.08); cursor: pointer; font-weight: 900; }
+    .back-btn { padding: 12px 18px; }
+    .month-btn { width: 42px; height: 42px; font-size: 22px; }
+    .calendar-card, .detail-card, .account-card { background: rgba(255,255,255,0.94); border-radius: 32px; box-shadow: var(--shadow); padding: 30px; border: 1px solid rgba(232,242,239,0.72); }
+    .month-control { display: flex; align-items: center; justify-content: center; gap: 22px; margin: 2px 0 28px; }
+    .month-title { font-size: 30px; font-weight: 900; min-width: 250px; text-align: center; }
+    .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 12px; }
+    .weekday { color: var(--muted); font-size: 15px; font-weight: 900; text-align: center; padding: 8px 0 12px; }
+    .calendar-day { min-height: 104px; border: 1px solid #e8f2ef; border-radius: 22px; background: #fff; color: var(--ink); display: flex; flex-direction: column; align-items: flex-start; justify-content: space-between; padding: 14px 16px; text-align: left; position: relative; transition: 0.18s ease; }
+    .calendar-day.outside { opacity: 0.30; }
+    .calendar-day.has-plan, .calendar-day.has-record { cursor: pointer; }
+    .calendar-day.has-plan { border: 1px dashed rgba(20,185,149,0.45); background: linear-gradient(135deg, #ffffff, #f2fffb); }
+    .calendar-day.has-record { border: none; box-shadow: 0 12px 28px rgba(19,190,143,0.12); }
+    .calendar-day.has-plan:hover, .calendar-day.has-record:hover { transform: translateY(-2px); }
+    .calendar-day .date-num { font-size: 26px; font-weight: 900; }
+    .day-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+    .record-tag, .plan-tag, .extra-tag { font-size: 12px; padding: 5px 9px; border-radius: 999px; font-weight: 900; }
+    .record-tag { background: rgba(20,185,149,0.12); color: #0b817c; }
+    .plan-tag { background: rgba(0,110,113,0.08); color: #006e71; }
+    .extra-tag { background: rgba(57,135,232,0.10); color: #3576ce; }
+    .score-mini { font-size: 12px; color: var(--muted); }
+
+    .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .summary-box { background: linear-gradient(180deg, #ffffff, #f8fffc); border: 1px solid var(--line); border-radius: 24px; padding: 20px; }
+    .summary-box .label { color: var(--muted); font-size: 14px; margin-bottom: 10px; }
+    .summary-box .value { font-size: 28px; font-weight: 900; }
+    .detail-layout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: stretch; }
+    .prescription-box, .record-list, .analysis-box { height: 100%; }
+    .record-list, .analysis-box, .prescription-box { background: #fff; border: 1px solid var(--line); border-radius: 28px; padding: 22px; }
+    .record-list h2, .analysis-box h2, .prescription-box h2 { margin: 0 0 18px; font-size: 24px; }
+    .record-row { display: grid; grid-template-columns: 44px 1fr minmax(150px, 190px); align-items: center; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+    .record-row:last-child { border-bottom: none; }
+    .record-name { font-weight: 900; font-size: 17px; margin-bottom: 4px; }
+    .record-desc { color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .record-result { text-align: right; font-weight: 900; font-size: 17px; }
+    .analysis-item { border-radius: 20px; background: #f8fffc; padding: 16px; margin-bottom: 14px; border: 1px solid var(--line); }
+    .analysis-item strong { display: block; font-size: 17px; margin-bottom: 8px; }
+    .analysis-item p { margin: 0; color: var(--muted); line-height: 1.62; font-size: 14px; }
+    .pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 0; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 999px; background: #e9fff7; color: #0b817c; font-size: 12px; font-weight: 900; }
+
+    .action-detail-grid { display: grid; grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr); gap: 22px; align-items: start; }
+    .action-intro { background: rgba(255,255,255,0.94); border-radius: 32px; box-shadow: var(--shadow); padding: 28px; border: 1px solid rgba(232,242,239,0.72); }
+    .action-title-row { display: grid; grid-template-columns: 64px 1fr; gap: 16px; align-items: center; margin-bottom: 20px; }
+    .action-title-row .icon { width: 64px; height: 64px; border-radius: 22px; background: #e9fff7; display: grid; place-items: center; }
+    .action-title-row h2 { margin: 0 0 6px; font-size: 30px; }
+    .action-subtitle { color: var(--muted); font-size: 14px; }
+    .intro-paragraph { color: #375e5a; line-height: 1.85; font-size: 16px; margin: 0 0 20px; }
+    .standard-list { display: grid; gap: 10px; }
+    .standard-item { border-radius: 18px; background: #f8fffc; border: 1px solid var(--line); padding: 13px 14px; color: var(--muted); line-height: 1.55; }
+    .standard-item strong { color: var(--ink); }
+    .media-grid { display: grid; grid-template-columns: 1fr; grid-template-rows: repeat(2, minmax(0, 1fr)); gap: 18px; height: 100%; min-height: 690px; }
+    .media-box { min-height: 330px; border-radius: 30px; background: linear-gradient(135deg, #052f33, #0a6f6b); overflow: hidden; color: #fff; position: relative; box-shadow: var(--shadow); display: grid; place-items: center; padding: 24px; }
+    .media-box.camera { background: linear-gradient(135deg, #092f36, #135d6f); }
+    .media-box .media-label { position: absolute; left: 20px; top: 18px; background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.20); border-radius: 999px; padding: 8px 12px; font-size: 13px; font-weight: 900; }
+    .media-placeholder { text-align: center; max-width: 420px; }
+    .media-placeholder .big { font-size: 54px; display: block; margin-bottom: 12px; }
+    .media-placeholder strong { display: block; font-size: 22px; margin-bottom: 8px; }
+    .media-placeholder p { margin: 0; color: rgba(255,255,255,0.72); line-height: 1.6; }
+    .fullscreen-btn { position: absolute; right: 18px; bottom: 18px; border: none; border-radius: 999px; background: rgba(255,255,255,0.92); color: #063e3a; padding: 10px 14px; font-weight: 900; cursor: pointer; opacity: 0; transform: translateY(6px); transition: 0.18s ease; }
+    .media-box:hover .fullscreen-btn { opacity: 1; transform: translateY(0); }
+    .media-box:fullscreen { border-radius: 0; width: 100vw; height: 100vh; }
+    .media-box:fullscreen .fullscreen-btn { opacity: 1; transform: translateY(0); }
+
+    .account-layout { display: grid; grid-template-columns: 220px 1fr; gap: 26px; align-items: center; }
+    .avatar { width: 160px; height: 160px; border-radius: 44px; display: grid; place-items: center; background: linear-gradient(135deg, #dfff69, #10b78f); font-size: 72px; box-shadow: 0 20px 50px rgba(16,183,143,0.22); margin: 0 auto; }
+    .account-info h2 { margin: 0 0 10px; font-size: 32px; }
+    .status-pill { display: inline-flex; align-items: center; gap: 8px; padding: 9px 13px; background: #e9fff7; color: #0b817c; border-radius: 999px; font-weight: 900; margin: 12px 0 22px; }
+    .status-pill.logged-out { color: var(--danger); background: #fff1f2; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #14b995; }
+    .logged-out .dot { background: var(--danger); }
+
+    .patient-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .patient-card { border: 1px solid var(--line); background: #fff; border-radius: 28px; padding: 20px; cursor: pointer; transition: 0.18s ease; text-align: left; }
+    .patient-card:hover, .patient-card.active { transform: translateY(-2px); box-shadow: 0 20px 46px rgba(0,70,65,0.08); border-color: #bfeee2; }
+    .patient-avatar { width: 56px; height: 56px; border-radius: 20px; display: grid; place-items: center; background: #e9fff7; font-size: 28px; margin-bottom: 14px; }
+    .patient-card h3 { margin: 0 0 8px; font-size: 22px; }
+    .patient-card p { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0 10px; }
+    th { text-align: left; color: var(--muted); font-size: 13px; padding: 0 14px 4px; }
+    td { background: #fff; padding: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); vertical-align: top; }
+    td:first-child { border-left: 1px solid var(--line); border-radius: 18px 0 0 18px; }
+    td:last-child { border-right: 1px solid var(--line); border-radius: 0 18px 18px 0; }
+    .action-chips { display: flex; flex-wrap: wrap; gap: 7px; }
+    .action-chip { display: inline-flex; padding: 6px 9px; border-radius: 999px; background: #e9fff7; color: #0b817c; font-size: 12px; font-weight: 900; }
+    .template-row { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 18px; }
+    .assign-toolbar { display: grid; grid-template-columns: minmax(220px, 1.1fr) 180px 170px auto; gap: 14px; align-items: end; margin-bottom: 24px; }
+    .assign-field label { display:block; font-weight:900; color: var(--muted); font-size:13px; margin-bottom:8px; }
+    .assign-field input, .assign-field select { width:100%; height:46px; border-radius:18px; border:1px solid var(--line); background:#fff; color:var(--ink); padding:0 14px; outline:none; font-weight:800; }
+    .assign-table th:first-child, .assign-table td:first-child { width: 150px; min-width: 150px; white-space: nowrap; }
+    .assign-date strong { white-space: nowrap; display:block; font-size:17px; }
+    .assign-date .ex-sub { white-space: nowrap; }
+    .assign-table td:nth-child(2), .assign-table th:nth-child(2) { width: 190px; min-width: 190px; }
+    .toast { position: fixed; right: 28px; bottom: 28px; background: #093f3c; color: #fff; border-radius: 18px; padding: 14px 18px; box-shadow: var(--shadow); z-index: 1000; opacity: 0; transform: translateY(10px); pointer-events: none; transition: 0.22s ease; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+
+    @media (max-width: 1180px) {
+      .app { grid-template-columns: 70px 1fr; padding: 20px; }
+      .content { padding-left: 24px; }
+      .grid { grid-template-columns: 1fr; }
+      .day-card { grid-template-columns: 82px repeat(4, minmax(90px, 1fr)); column-gap: 16px; }
+      .plan-grid, .action-grid, .action-detail-grid, .detail-layout { grid-template-columns: 1fr; }
+      .media-grid { min-height: 560px; }
+      .exercise.quick-start { grid-column: auto; }
+      .header { grid-template-columns: 1fr; gap: 18px; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .account-layout { grid-template-columns: 1fr; }
+      .calendar-day { min-height: 86px; padding: 10px; }
+      .patient-grid { grid-template-columns: 1fr; }
+      .login-card { grid-template-columns: 1fr; }
+      .login-hero { min-height: auto; }
+      .hero-panel { position: static; margin-top: 34px; }
+    }
+  </style>
+</head>
+<body>
+  <section id="loginScreen" class="login-screen">
+    <div class="login-card">
+      <div class="login-hero">
+        <h1>膝关节交互式康复系统</h1>
+        <p>面向患者和康复师的训练计划、动作识别、处方管理与恢复趋势展示 Demo。患者端聚焦“今天怎么练、练得怎么样”，康复师端聚焦“给谁开处方、执行得如何”。</p>
+        <div class="hero-badges">
+          <span class="hero-badge">📊 动作质量评分</span>
+          <span class="hero-badge">📅 月度运动处方</span>
+          <span class="hero-badge">🎥 动作专属训练页</span>
+        </div>
+        <div class="hero-panel">
+          <div class="hero-stat"><span>今日处方动作</span><strong>4 项</strong></div>
+          <div class="hero-stat"><span>本月处方周期</span><strong>30 天</strong></div>
+          <div class="hero-stat"><span>账号类型</span><strong>患者 / 康复师</strong></div>
+        </div>
+      </div>
+      <div class="login-form-wrap">
+        <div class="login-tabs">
+          <button id="loginModeBtn" class="login-tab active" onclick="switchAuthMode('login')">登录</button>
+          <button id="registerModeBtn" class="login-tab" onclick="switchAuthMode('register')">注册新账号</button>
+        </div>
+        <div class="form-title" id="authTitle">登录系统</div>
+        <div class="form-sub" id="authSub">输入演示账号和密码进入对应界面，也可以直接使用下面的快速入口。</div>
+        <div class="field"><label>账号</label><input id="usernameInput" value="patient" placeholder="请输入账号" /></div>
+        <div class="field"><label>密码</label><input id="passwordInput" type="password" value="123456" placeholder="请输入密码" /></div>
+        <div class="field" id="roleField" style="display:none;"><label>注册账号类型</label><select id="registerRole"><option value="patient">患者账号</option><option value="therapist">康复师账号</option></select></div>
+        <button class="login-btn" id="authSubmitBtn" onclick="submitAuth()">登录</button>
+        <div class="demo-actions">
+          <button onclick="quickLogin('patient')">患者端 Demo</button>
+          <button onclick="quickLogin('therapist')">康复师端 Demo</button>
+        </div>
+        <div class="hint-box">演示账号：患者 <b>patient / 123456</b>；康复师 <b>therapist / 123456</b>。注册新账号会临时加入当前 Demo，不连接真实后端。</div>
+      </div>
+    </div>
+  </section>
+
+  <div id="app" class="app">
+    <aside class="sidebar" id="sidebar"></aside>
+    <main class="content" id="content"></main>
+  </div>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const TODAY = '2026-06-11';
+    let authMode = 'login';
+    let session = null;
+    let selectedPatientId = 'p001';
+    let currentYear = 2026;
+    let currentMonth = 6;
+    let assignState = { startDate: '2026-06-11', pageSize: 7, template: 'straight_raise' };
+    let lastPatientView = 'dashboard';
+    let lastTherapistView = 'patients';
+
+    function iconSvg(id) {
+      const common = 'class="rehab-icon" viewBox="0 0 64 64" aria-hidden="true"';
+      const icons = {
+        ankle_pump: `<svg ${common}><path class="bed" d="M8 49H30"/><path class="leg" d="M12 44 C22 44 28 40 34 34 C39 29 44 29 49 32"/><path class="leg" d="M49 32 L56 32 L58 25"/><circle class="dot" cx="49" cy="32" r="2.6"/><path class="accent thin" d="M45 18 A15 15 0 0 1 59 29"/><path class="accent thin" d="M55 22 L60 30 L51 30"/><path class="press" d="M57 39 A15 15 0 0 1 43 53"/><path class="press" d="M50 54 L42 53 L45 45"/></svg>`,
+        quadriceps_isometric: `<svg ${common}><path class="bed" d="M9 48H55"/><path class="leg" d="M12 41 C23 41 31 37 38 31 C45 25 53 24 58 27"/><path class="accent" d="M35 29 C41 21 51 20 58 24"/><path class="press" d="M38 38 C44 34 51 34 57 38"/><circle class="dot" cx="45" cy="28" r="2.6"/></svg>`,
+        hamstring_isometric: `<svg ${common}><path class="bed" d="M8 49H56"/><path class="leg" d="M12 40 C23 40 32 36 39 30 C46 24 53 24 58 27"/><path class="accent" d="M38 34 C45 39 52 39 58 35"/><path class="press" d="M43 13 L43 29"/><path class="press" d="M36 24 L43 31 L50 24"/><circle class="dot" cx="39" cy="30" r="2.4"/></svg>`,
+        supine_straight_leg_raise: `<svg ${common}><path class="bed" d="M9 51H31"/><path class="leg" d="M13 46 C24 46 31 42 38 35"/><path class="leg" d="M38 35 L57 19"/><path class="accent" d="M52 18 L59 13"/><path class="accent" d="M55 11 L60 12 L59 17"/><circle class="dot" cx="38" cy="35" r="2.6"/></svg>`,
+        side_lying_hip_abduction: `<svg ${common}><path class="bed" d="M9 49H56"/><path class="leg" d="M16 43 C26 43 34 41 41 37"/><path class="leg" d="M41 37 L56 24"/><path class="bed" d="M20 50 C30 50 39 49 48 47"/><path class="accent" d="M51 22 L59 15"/><path class="accent" d="M55 13 L60 14 L59 19"/><circle class="dot" cx="41" cy="37" r="2.6"/></svg>`,
+        prone_hip_extension: `<svg ${common}><path class="bed" d="M8 48H56"/><path class="leg" d="M50 42 C41 42 34 39 28 34"/><path class="leg" d="M28 34 L12 22"/><path class="accent" d="M14 19 L7 13"/><path class="accent" d="M9 12 L6 13 L7 18"/><circle class="dot" cx="28" cy="34" r="2.6"/></svg>`,
+        supine_knee_flexion: `<svg ${common}><path class="bed" d="M9 50H56"/><path class="leg" d="M13 42 C24 42 32 38 39 32"/><path class="leg" d="M39 32 L51 43"/><path class="accent thin" d="M48 25 A16 16 0 0 1 55 42"/><path class="accent thin" d="M52 35 L55 43 L47 41"/><circle class="dot" cx="39" cy="32" r="2.6"/></svg>`,
+        bed_knee_flexion: `<svg ${common}><path class="bed" d="M8 50H56"/><path class="leg" d="M13 43 C24 43 32 38 39 30"/><path class="leg" d="M39 30 L51 42"/><path class="accent" d="M30 31 A18 18 0 0 1 43 19"/><path class="press" d="M52 33 A14 14 0 0 1 44 44"/><circle class="dot" cx="39" cy="30" r="2.6"/></svg>`,
+        quick: `<svg ${common}><path class="accent" d="M23 15 L49 32 L23 49 Z" fill="#20bd8f" stroke="none"/><path class="press" d="M14 18V46"/></svg>`
+      };
+      return icons[id] || icons.quick;
+    }
+
+    const actions = {
+      ankle_pump: {
+        id: 'ankle_pump', name: '主动踝泵练习', shortName: '踝泵运动', type: 'quantity', icon: iconSvg('ankle_pump'),
+        defaultSub: '数量评价：目标次数与踝关节活动幅度',
+        criteria: '勾脚、放松、下踩、放松构成一个循环；每个循环内踝关节角度活动幅度达到 12° 以上则视为视觉达标。',
+        intro: '踝泵运动主要活动小腿和足踝部位，通过反复勾脚和下踩促进下肢血液循环，帮助减轻术后肿胀，也有助于预防静脉血栓。训练时请保持膝关节伸直，让脚尖有控制地向上勾起，再向下绷直。系统主要考核完成次数和踝关节活动幅度，幅度越稳定、节奏越完整，训练质量越好。',
+        benefits: ['促进下肢循环', '减轻肿胀', '维持踝关节活动度'],
+        standard: ['患腿伸直，足跟和脚尖尽量保持在画面内', '勾脚和下踩都要做到位，不要只轻微抖动脚尖', '按照语音节拍完成，避免过快抢拍']
+      },
+      quadriceps_isometric: {
+        id: 'quadriceps_isometric', name: '股四头肌等长收缩', shortName: '股四头肌收缩', type: 'quantity', icon: iconSvg('quadriceps_isometric'),
+        defaultSub: '数量评价：收紧保持 5 秒 + 放松 2 秒',
+        criteria: '按节拍完成收紧与放松；系统以起始位稳定、下肢位置保持和节拍完成次数作为主要记录。',
+        intro: '股四头肌位于大腿前侧，是伸直膝关节和稳定膝盖的重要肌肉。这个动作不需要明显抬腿，而是让患腿尽量伸直，把膝盖后方向床面轻轻压紧，同时主动绷紧大腿前侧。它可以帮助恢复膝关节伸直控制能力，为后续站立、行走和上下楼打基础。系统主要考核您是否按照节拍完成足够次数。',
+        benefits: ['恢复膝关节伸直力量', '改善大腿前侧肌肉激活', '增强站立与行走稳定性'],
+        standard: ['患腿放平并尽量伸直', '收紧时保持 5 秒，不要屏气', '放松后再进入下一次，不要连续乱用力']
+      },
+      hamstring_isometric: {
+        id: 'hamstring_isometric', name: '腘绳肌等长收缩', shortName: '腘绳肌收缩', type: 'quantity', icon: iconSvg('hamstring_isometric'),
+        defaultSub: '数量评价：膝后方贴床保持 5 秒 + 放松 2 秒',
+        criteria: '按节拍完成收紧与放松；系统记录等长节拍完成次数，并监测下肢是否离开起始位。',
+        intro: '腘绳肌位于大腿后侧，参与膝关节稳定和屈曲控制。这个动作要求患腿伸直放在床面上，尽量让膝盖后方贴近床面，感觉大腿后侧和膝后方轻轻用力。它可以帮助您找回膝后侧控制感，配合股四头肌训练共同提高膝关节稳定性。系统主要按照节拍记录完成次数。',
+        benefits: ['改善膝后侧肌肉控制', '帮助膝关节稳定', '配合伸膝训练改善整体控制'],
+        standard: ['患腿伸直放稳，动作过程中不要大幅移动', '保持 5 秒后充分放松', '如果膝后方无法贴床，可以在舒适范围内完成']
+      },
+      supine_straight_leg_raise: {
+        id: 'supine_straight_leg_raise', name: '仰卧位直抬腿', shortName: '直腿抬高', type: 'quality', icon: iconSvg('supine_straight_leg_raise'),
+        defaultSub: '质量评价：抬腿角度、膝伸直控制、保持时间',
+        criteria: '患腿伸直抬起，目标抬腿角约 15°；达到目标角后保持 1.5 秒，并在回位稳定后计数。',
+        intro: '直腿抬高主要训练大腿前侧力量和膝关节伸直控制。练习时请仰卧，把患腿尽量伸直后缓慢抬起，不要让膝盖明显弯曲。这个动作能帮助您判断股四头肌是否能在抬腿时稳定控制膝盖，也是从床上训练过渡到下地活动的重要基础。系统会观察抬腿角度、膝盖是否保持伸直，以及达到目标角后的保持时间。',
+        benefits: ['增强股四头肌力量', '训练膝伸直控制', '为下床行走做准备'],
+        standard: ['抬腿过程中膝盖尽量不要弯', '达到约 15° 后保持至少 1.5 秒', '放下时要慢，不要突然落下']
+      },
+      side_lying_hip_abduction: {
+        id: 'side_lying_hip_abduction', name: '侧抬腿练习', shortName: '侧抬腿', type: 'quality', icon: iconSvg('side_lying_hip_abduction'),
+        defaultSub: '质量评价：侧卧抬腿角度、保持时间、骨盆稳定',
+        criteria: '侧卧时患侧腿在上，伸直向上抬；目标抬腿角约 12°，达到目标后保持 1.5 秒。',
+        intro: '侧抬腿主要训练髋外展肌群，尤其是臀中肌。虽然它不是直接让膝盖弯伸，但臀部和髋部力量会影响走路时膝盖是否稳定。练习时请侧卧，患侧腿放在上方，膝盖尽量伸直，向上缓慢抬起再放下。系统会考核抬腿角度、保持时间和腿部直线控制，帮助减少代偿动作。',
+        benefits: ['增强髋外展力量', '改善走路时膝关节稳定性', '减少骨盆晃动和膝内扣倾向'],
+        standard: ['侧卧姿势稳定，身体不要向后翻', '患腿伸直向上抬，不要用腰部甩动', '达到目标角后保持 1.5 秒再放下']
+      },
+      prone_hip_extension: {
+        id: 'prone_hip_extension', name: '后抬腿练习', shortName: '后抬腿', type: 'quality', icon: iconSvg('prone_hip_extension'),
+        defaultSub: '质量评价：俯卧后抬角度、保持时间、避免拱腰',
+        criteria: '俯卧时患腿伸直向后抬；目标抬腿角约 12°，达到目标后保持 1.0 秒，并尽量避免腰部代偿。',
+        intro: '后抬腿主要训练臀大肌和髋后侧力量，这些肌肉可以帮助您站立、迈步和上下台阶时更稳定。练习时请俯卧，患腿伸直，轻轻向后抬起，不要为了抬得更高而明显拱腰。系统会记录后抬角度、保持时间以及膝盖是否保持伸直。动作不需要追求很高，控制稳定更重要。',
+        benefits: ['增强臀部和髋后侧力量', '提高站立与步态稳定性', '减少腰部代偿'],
+        standard: ['俯卧放平，患腿伸直向后抬', '目标约 12°，保持至少 1 秒', '腰部不要明显拱起或扭转']
+      },
+      supine_knee_flexion: {
+        id: 'supine_knee_flexion', name: '仰卧屈膝', shortName: '仰卧屈膝', type: 'quality', icon: iconSvg('supine_knee_flexion'),
+        defaultSub: '质量评价：目标屈膝角、保持时间、回位控制',
+        criteria: '从膝关节接近伸直开始，逐渐屈膝到目标角；目标屈膝角约 120°，保持 6 秒后再伸直回位。',
+        intro: '仰卧屈膝主要训练膝关节弯曲活动度。练习时从伸直位开始，慢慢把脚跟向身体方向收，让膝盖逐渐弯曲到舒适的最大范围。这个动作有助于恢复坐下、起立、上下楼和日常活动所需的膝关节弯曲能力。系统会考核最大屈膝角度、是否达到目标角，以及在目标角附近能否稳定保持。',
+        benefits: ['恢复膝关节屈曲活动度', '改善坐立和上下楼能力', '帮助观察每日弯曲角进步'],
+        standard: ['从接近伸直位开始，动作缓慢连续', '尽量达到处方目标角并保持 6 秒', '回到伸直位时也要有控制']
+      },
+      bed_knee_flexion: {
+        id: 'bed_knee_flexion', name: '床上弯腿', shortName: '床上弯腿', type: 'quality', icon: iconSvg('bed_knee_flexion'),
+        defaultSub: '质量评价：大腿上抬角、最大屈膝角、10 秒稳定性',
+        criteria: '先把大腿抬到舒适位置，再屈膝到最大限度；在最大位置保持 10 秒，系统记录角度和稳定性。',
+        intro: '床上弯腿更接近日常活动中的综合屈膝动作，会同时观察大腿上抬和膝盖弯曲。练习时先把患侧大腿慢慢抬起，再把小腿向大腿方向收，达到自己舒适的最大弯曲位置后保持。这个动作可以帮助您逐步扩大活动范围，也能让康复师看到大腿控制、屈膝角度和保持稳定性的变化。',
+        benefits: ['综合训练髋膝配合', '提高膝关节弯曲范围', '观察保持期稳定性'],
+        standard: ['先抬大腿，再缓慢屈膝', '在最大舒适位置保持 10 秒', '不要用突然发力或疼痛代偿来追求角度']
+      }
+    };
+
+    const users = {
+      patient: { username: 'patient', password: '123456', role: 'patient', patientId: 'p001', name: '李明', avatar: '🧑‍🦽' },
+      therapist: { username: 'therapist', password: '123456', role: 'therapist', name: '王康复师', avatar: '👩‍⚕️' }
+    };
+
+    const patients = {
+      p001: { id: 'p001', name: '李明', avatar: '🧑‍🦽', age: 62, diagnosis: '左膝关节置换术后第 11 天', therapist: '王康复师', prescriptions: {}, records: {}, extraRecords: {} },
+      p002: { id: 'p002', name: '张敏', avatar: '🧑‍💼', age: 57, diagnosis: '右膝半月板术后康复期', therapist: '王康复师', prescriptions: {}, records: {}, extraRecords: {} },
+      p003: { id: 'p003', name: '陈浩', avatar: '🧑', age: 68, diagnosis: '膝关节置换术后早期', therapist: '王康复师', prescriptions: {}, records: {}, extraRecords: {} }
+    };
+
+    function pad(n) { return String(n).padStart(2, '0'); }
+    function key(y, m, d) { return `${y}-${pad(m)}-${pad(d)}`; }
+    function dateObj(dateKey) { const [y,m,d] = dateKey.split('-').map(Number); return new Date(y, m - 1, d); }
+    function dayName(dateKey) { return ['周日','周一','周二','周三','周四','周五','周六'][dateObj(dateKey).getDay()]; }
+
+    function makeGoal(id, target, label) { return { id, target, label }; }
+    function initPrescriptions(patient, offset = 0) {
+      for (let d = 1; d <= 30; d++) {
+        const date = key(2026, 6, d);
+        let actionsForDay = [];
+        if (d <= 7) {
+          actionsForDay = [makeGoal('ankle_pump', 600 + offset * 20, `目标 ${600 + offset * 20} 次`), makeGoal('quadriceps_isometric', 300, '目标 300 次'), makeGoal('hamstring_isometric', 300, '目标 300 次')];
+        } else if (d <= 14) {
+          actionsForDay = [makeGoal('ankle_pump', 800 + offset * 20, `目标 ${800 + offset * 20} 次`), makeGoal('quadriceps_isometric', 400, '目标 400 次'), makeGoal('hamstring_isometric', 400, '目标 400 次'), makeGoal('supine_straight_leg_raise', 15, '目标抬腿 15°，保持 1.5 秒')];
+        } else if (d <= 21) {
+          actionsForDay = [makeGoal('ankle_pump', 1000, '目标 1000 次'), makeGoal('quadriceps_isometric', 500, '目标 500 次'), makeGoal('hamstring_isometric', 500, '目标 500 次'), makeGoal('supine_straight_leg_raise', 15, '目标抬腿 15°，保持 1.5 秒'), makeGoal('supine_knee_flexion', 110, '目标屈膝 110°，保持 6 秒')];
+        } else {
+          actionsForDay = [makeGoal('ankle_pump', 1000, '目标 1000 次'), makeGoal('quadriceps_isometric', 500, '目标 500 次'), makeGoal('hamstring_isometric', 500, '目标 500 次'), makeGoal('supine_straight_leg_raise', 15, '目标抬腿 15°，保持 1.5 秒'), makeGoal('side_lying_hip_abduction', 12, '目标侧抬 12°，保持 1.5 秒'), makeGoal('prone_hip_extension', 12, '目标后抬 12°，保持 1 秒'), makeGoal('supine_knee_flexion', 120, '目标屈膝 120°，保持 6 秒'), makeGoal('bed_knee_flexion', 10, '最大位保持 10 秒')];
+        }
+        patient.prescriptions[date] = {
+          date,
+          template: d <= 7 ? '术后早期基础模板' : d <= 14 ? '基础 + 直腿抬高模板' : d <= 21 ? '屈膝活动度进阶模板' : '综合力量与活动度模板',
+          actions: actionsForDay
+        };
+      }
+    }
+
+    function makeActionResult(id, percent, actual, note, counted = true) { return { id, percent, actual, note, counted }; }
+    function addRecord(patient, date, score, qty, quality, stability, results, extra = []) {
+      patient.records[date] = { date, score, qty, quality, stability, results };
+      if (extra.length) patient.extraRecords[date] = extra;
+    }
+
+    function initDemoData() {
+      initPrescriptions(patients.p001, 0);
+      initPrescriptions(patients.p002, -1);
+      initPrescriptions(patients.p003, 1);
+      addRecord(patients.p001, '2026-06-01', 58, 62, 0, 68, [makeActionResult('ankle_pump', 64, '385 / 600 次', '踝泵次数不足，建议分散到多时段完成'), makeActionResult('quadriceps_isometric', 56, '168 / 300 次', '收缩节拍完成偏少'), makeActionResult('hamstring_isometric', 58, '174 / 300 次', '起始位基本稳定')]);
+      addRecord(patients.p001, '2026-06-02', 64, 67, 0, 70, [makeActionResult('ankle_pump', 68, '408 / 600 次', '踝关节幅度较前一日改善'), makeActionResult('quadriceps_isometric', 65, '195 / 300 次', '节拍完成较稳定'), makeActionResult('hamstring_isometric', 68, '204 / 300 次', '可继续增加分组次数')]);
+      addRecord(patients.p001, '2026-06-03', 70, 72, 0, 73, [makeActionResult('ankle_pump', 75, '450 / 600 次', '完成度继续提高'), makeActionResult('quadriceps_isometric', 70, '210 / 300 次', '保持节奏较好'), makeActionResult('hamstring_isometric', 72, '216 / 300 次', '下肢位置稳定')]);
+      addRecord(patients.p001, '2026-06-04', 76, 78, 0, 76, [makeActionResult('ankle_pump', 82, '492 / 600 次', '已接近目标'), makeActionResult('quadriceps_isometric', 74, '222 / 300 次', '保持时间较稳定'), makeActionResult('hamstring_isometric', 78, '234 / 300 次', '建议继续分组完成')]);
+      addRecord(patients.p001, '2026-06-05', 81, 84, 0, 80, [makeActionResult('ankle_pump', 88, '528 / 600 次', '完成情况良好'), makeActionResult('quadriceps_isometric', 82, '246 / 300 次', '控制水平改善'), makeActionResult('hamstring_isometric', 82, '246 / 300 次', '节拍基本稳定')]);
+      addRecord(patients.p001, '2026-06-06', 74, 76, 0, 75, [makeActionResult('ankle_pump', 78, '468 / 600 次', '当天完成次数略低'), makeActionResult('quadriceps_isometric', 75, '225 / 300 次', '建议避免漏练'), makeActionResult('hamstring_isometric', 76, '228 / 300 次', '动作完成尚可')]);
+      addRecord(patients.p001, '2026-06-07', 84, 86, 0, 82, [makeActionResult('ankle_pump', 90, '540 / 600 次', '完成情况较好'), makeActionResult('quadriceps_isometric', 84, '252 / 300 次', '节拍稳定'), makeActionResult('hamstring_isometric', 84, '252 / 300 次', '可进入下一阶段')]);
+      addRecord(patients.p001, '2026-06-08', 66, 69, 58, 70, [makeActionResult('ankle_pump', 66, '528 / 800 次', '处方目标提高后完成度下降'), makeActionResult('quadriceps_isometric', 70, '280 / 400 次', '数量完成一般'), makeActionResult('hamstring_isometric', 71, '284 / 400 次', '节拍稳定'), makeActionResult('supine_straight_leg_raise', 58, '最大 13°，保持 1.0 秒', '直腿抬高尚未稳定达到目标')]);
+      addRecord(patients.p001, '2026-06-09', 78, 76, 81, 76, [makeActionResult('ankle_pump', 78, '624 / 800 次', '数量较昨日提升'), makeActionResult('quadriceps_isometric', 74, '296 / 400 次', '节拍完成较稳定'), makeActionResult('hamstring_isometric', 76, '304 / 400 次', '起始位稳定'), makeActionResult('supine_straight_leg_raise', 81, '最大 15°，保持 1.4 秒', '接近目标保持时间')]);
+      addRecord(patients.p001, '2026-06-10', 92, 96, 89, 84, [makeActionResult('ankle_pump', 98, '784 / 800 次', '数量目标基本完成'), makeActionResult('quadriceps_isometric', 96, '384 / 400 次', '节拍完整'), makeActionResult('hamstring_isometric', 94, '376 / 400 次', '下肢位置稳定'), makeActionResult('supine_straight_leg_raise', 89, '最大 16°，保持 1.8 秒', '达到目标，膝伸直控制较好')], [makeActionResult('side_lying_hip_abduction', 0, '额外完成 2 组，最大 10°', '该动作未在当日处方内，已记录但不计入总分', false)]);
+      addRecord(patients.p001, '2026-06-11', 52, 48, 43, 58, [makeActionResult('ankle_pump', 45, '360 / 800 次', '今日已完成部分踝泵训练'), makeActionResult('quadriceps_isometric', 45, '180 / 400 次', '今日已完成部分股四头肌收缩'), makeActionResult('hamstring_isometric', 53, '210 / 400 次', '今日已完成部分腘绳肌收缩'), makeActionResult('supine_straight_leg_raise', 28, '最大 13°，保持 0.8 秒', '直腿抬高尚未达到今日目标')]);
+
+      ['p002','p003'].forEach((pid, idx) => {
+        const p = patients[pid];
+        const base = idx === 0 ? 72 : 83;
+        addRecord(p, '2026-06-09', base, base + 2, idx ? 80 : 68, base - 1, [makeActionResult('ankle_pump', base, `${Math.round((base/100)*800)} / 800 次`, '演示记录'), makeActionResult('quadriceps_isometric', base-2, `${Math.round((base/100)*400)} / 400 次`, '演示记录'), makeActionResult('hamstring_isometric', base, `${Math.round((base/100)*400)} / 400 次`, '演示记录')]);
+        addRecord(p, '2026-06-10', base + 5, base + 5, idx ? 86 : 74, base + 3, [makeActionResult('ankle_pump', base+5, `${Math.round(((base+5)/100)*800)} / 800 次`, '演示记录'), makeActionResult('quadriceps_isometric', base+2, `${Math.round(((base+2)/100)*400)} / 400 次`, '演示记录'), makeActionResult('hamstring_isometric', base+4, `${Math.round(((base+4)/100)*400)} / 400 次`, '演示记录'), makeActionResult('supine_straight_leg_raise', idx ? 86 : 74, idx ? '最大 15°，保持 1.6 秒' : '最大 14°，保持 1.2 秒', '演示记录')]);
+      });
+    }
+
+    initDemoData();
+
+    function hexToRgb(hex) {
+      const h = hex.replace('#', '');
+      return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+    }
+    function rgbToHex(rgb) { return '#' + rgb.map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2,'0')).join(''); }
+    function mix(c1, c2, t) { const a = hexToRgb(c1), b = hexToRgb(c2); return rgbToHex(a.map((v,i) => v * (1-t) + b[i] * t)); }
+    function interpolateColor(score) {
+      const stops = [
+        { s: 0, c: '#bf6363' },
+        { s: 60, c: '#df8a62' },
+        { s: 75, c: '#e6d668' },
+        { s: 88, c: '#99df64' },
+        { s: 100, c: '#12b98c' }
+      ];
+      let left = stops[0], right = stops[stops.length - 1];
+      for (let i = 0; i < stops.length - 1; i++) {
+        if (score >= stops[i].s && score <= stops[i+1].s) { left = stops[i]; right = stops[i+1]; break; }
+      }
+      const t = right.s === left.s ? 0 : (score - left.s) / (right.s - left.s);
+      return mix(left.c, right.c, t);
+    }
+    function scoreTheme(score, pale = false) {
+      if (score == null) return { bg1: '#ffffff', bg2: '#f2fffb', text: '#073f3c', color: '#bfeee2' };
+      const base = interpolateColor(score);
+      const bg1 = pale ? mix(base, '#ffffff', 0.72) : mix(base, '#dfff69', score >= 85 ? 0.18 : 0.04);
+      const bg2 = pale ? mix(base, '#ffffff', 0.84) : mix(base, '#006e71', score >= 88 ? 0.20 : 0.04);
+      const text = score >= 88 ? '#ffffff' : '#073f3c';
+      return { bg1, bg2, text, color: base };
+    }
+
+    function getPatient() { return patients[session?.patientId || selectedPatientId] || patients.p001; }
+    function getPlan(patient, date = TODAY) { return patient.prescriptions?.[date] || null; }
+    function goalLine(goal) { return goal ? `${actions[goal.id].type === 'quantity' ? '数量评价' : '质量评价'}：${goal.label}` : ''; }
+    function isPrescribed(patient, date, actionId) { const plan = getPlan(patient, date); return !!plan?.actions.some(g => g.id === actionId); }
+
+    function switchAuthMode(mode) {
+      authMode = mode;
+      document.getElementById('loginModeBtn').classList.toggle('active', mode === 'login');
+      document.getElementById('registerModeBtn').classList.toggle('active', mode === 'register');
+      document.getElementById('roleField').style.display = mode === 'register' ? 'block' : 'none';
+      document.getElementById('authTitle').textContent = mode === 'login' ? '登录系统' : '注册新账号';
+      document.getElementById('authSub').textContent = mode === 'login' ? '输入演示账号和密码进入对应界面，也可以直接使用下面的快速入口。' : '选择账号类型并设置账号密码，注册后会直接进入对应端的 Demo 界面。';
+      document.getElementById('authSubmitBtn').textContent = mode === 'login' ? '登录' : '注册并登录';
+    }
+    function submitAuth() {
+      const username = document.getElementById('usernameInput').value.trim();
+      const password = document.getElementById('passwordInput').value;
+      if (!username || !password) return showToast('请输入账号和密码');
+      if (authMode === 'register') {
+        const role = document.getElementById('registerRole').value;
+        if (users[username]) return showToast('该账号已存在，请换一个账号名');
+        if (role === 'patient') {
+          const id = 'p' + pad(Object.keys(patients).length + 1);
+          patients[id] = { id, name: username, avatar: '🙂', age: '-', diagnosis: '新注册患者', therapist: '未分配', prescriptions: {}, records: {}, extraRecords: {} };
+          initPrescriptions(patients[id], 0);
+          users[username] = { username, password, role, patientId: id, name: username, avatar: '🙂' };
+        } else {
+          users[username] = { username, password, role, name: username, avatar: '👩‍⚕️' };
+        }
+        setSession(users[username]);
+      } else {
+        const user = users[username];
+        if (!user || user.password !== password) return showToast('账号或密码不正确');
+        setSession(user);
+      }
+    }
+    function quickLogin(role) { setSession(role === 'patient' ? users.patient : users.therapist); }
+    function setSession(user) {
+      session = user;
+      if (user.role === 'patient') selectedPatientId = user.patientId;
+      document.getElementById('loginScreen').style.display = 'none';
+      document.getElementById('app').style.display = 'grid';
+      renderShell();
+      if (user.role === 'patient') showPatientView('dashboard'); else showTherapistView('patients');
+    }
+    function logout() {
+      session = null;
+      document.getElementById('app').style.display = 'none';
+      document.getElementById('loginScreen').style.display = 'grid';
+      document.getElementById('usernameInput').value = 'patient';
+      document.getElementById('passwordInput').value = '123456';
+      showToast('已退出登录');
+    }
+
+    function renderShell() {
+      const sidebar = document.getElementById('sidebar');
+      if (session.role === 'patient') {
+        sidebar.innerHTML = `
+          <div class="logo">🦵</div>
+          <button class="nav-item" data-view="dashboard" title="训练概览" onclick="showPatientView('dashboard')">📊</button>
+          <button class="nav-item" data-view="calendar" title="训练日历" onclick="showPatientView('calendar')">📅</button>
+          <button class="nav-item" data-view="actions" title="全部动作" onclick="showPatientView('actions')">🧩</button>
+          <div class="nav-spacer"></div>
+          <button class="nav-item" data-view="settings" title="账户设置" onclick="showPatientView('settings')">⚙️</button>`;
+      } else {
+        sidebar.innerHTML = `
+          <div class="logo">🩺</div>
+          <button class="nav-item" data-view="patients" title="切换病人" onclick="showTherapistView('patients')">👥</button>
+          <button class="nav-item" data-view="assign" title="处方分配" onclick="showTherapistView('assign')">📝</button>
+          <button class="nav-item" data-view="records" title="完成记录" onclick="showTherapistView('records')">📅</button>
+          <button class="nav-item" data-view="stats" title="统计概览" onclick="showTherapistView('stats')">📊</button>
+          <div class="nav-spacer"></div>
+          <button class="nav-item" data-view="settings" title="账户设置" onclick="showTherapistView('settings')">⚙️</button>`;
+      }
+    }
+    function setActive(view) { document.querySelectorAll('.nav-item').forEach(btn => btn.classList.toggle('active', btn.dataset.view === view)); }
+    function showPatientView(view) {
+      lastPatientView = view;
+      setActive(view);
+      const content = document.getElementById('content');
+      if (view === 'dashboard') content.innerHTML = renderPatientDashboard();
+      if (view === 'calendar') content.innerHTML = renderCalendarPage(getPatient(), 'patient');
+      if (view === 'actions') content.innerHTML = renderActionLibrary('patient');
+      if (view === 'settings') content.innerHTML = renderPatientSettings();
+      bindSearch();
+    }
+    function showTherapistView(view) {
+      lastTherapistView = view;
+      setActive(view);
+      const content = document.getElementById('content');
+      if (view === 'patients') content.innerHTML = renderTherapistPatients();
+      if (view === 'assign') content.innerHTML = renderTherapistAssign();
+      if (view === 'records') content.innerHTML = renderCalendarPage(patients[selectedPatientId], 'therapist');
+      if (view === 'stats') content.innerHTML = renderTherapistStats();
+      if (view === 'settings') content.innerHTML = renderTherapistSettings();
+      bindSearch();
+    }
+
+    function renderSearchBlock() {
+      return `<label class="search"><span>🔎</span><input id="globalSearch" placeholder="搜索训练动作 / 评估指标..." oninput="renderSearchResults(this.value)" onfocus="renderSearchResults(this.value)"/><div id="searchResults" class="search-results"></div></label>`;
+    }
+    function bindSearch() { setTimeout(() => { const input = document.getElementById('globalSearch'); if (input) input.addEventListener('keydown', e => { if (e.key === 'Escape') closeSearch(); }); }, 0); }
+    function renderSearchResults(q) {
+      const box = document.getElementById('searchResults');
+      if (!box) return;
+      const text = (q || '').trim();
+      if (!text) { box.classList.remove('active'); box.innerHTML = ''; return; }
+      const list = Object.values(actions).filter(a => `${a.name}${a.shortName}${a.defaultSub}${a.criteria}`.includes(text)).slice(0, 8);
+      box.classList.toggle('active', list.length > 0);
+      box.innerHTML = list.map(a => `<button class="search-row" onclick="openActionDetail('${a.id}', 'search')"><span class="search-icon">${a.icon}</span><span><div class="search-row-title">${a.name}</div><div class="search-row-sub">${a.type === 'quantity' ? '数量评价动作' : '质量评价动作'} · ${isPrescribed(getPatient(), TODAY, a.id) ? '今日处方内' : '未在今日处方内，完成后不计入总分'}</div></span></button>`).join('') || `<div class="ex-sub" style="padding:14px;">没有找到相关动作</div>`;
+    }
+    function closeSearch() { const box = document.getElementById('searchResults'); if (box) box.classList.remove('active'); }
+
+    function renderPatientDashboard() {
+      const patient = getPatient();
+      const plan = getPlan(patient, TODAY);
+      const records = Object.values(patient.records).filter(r => r.date < TODAY).sort((a,b) => a.date.localeCompare(b.date)).slice(-3);
+      return `<section class="header"><div><h1>膝关节交互式康复系统</h1><div class="subtitle">查看您的训练计划、动作质量与本周恢复趋势</div></div>${renderSearchBlock()}</section>
+      <section class="grid"><div class="history">${records.map(renderDayCard).join('')}</div><aside class="panel"><h2>过去一周统计</h2><div class="chart-wrap">${renderWeekChart(patient)}</div><div class="legend"><span><i class="main-l"></i>总分</span><span><i class="num-l"></i>数量套组</span><span><i class="quality-l"></i>质量套组</span></div></aside></section>
+      <section class="bottom"><div class="plan-card"><div class="plan-head"><h2>今天的训练计划</h2><div class="progress-total"><span>整体进度 ${todayProgress(patient)}%</span><div class="bar-bg"><div class="bar-fill" style="width:${todayProgress(patient)}%"></div></div></div></div><div class="plan-grid">${renderQuickStart()}${plan ? plan.actions.map(goal => renderExerciseCard(goal.id, goal, 'plan')).join('') : '<div class="ex-sub">今天暂无训练处方</div>'}</div></div></section>`;
+    }
+    function todayProgress(patient) {
+      const plan = getPlan(patient, TODAY);
+      if (!plan) return 0;
+      const rec = patient.records[TODAY];
+      if (!rec) return 0;
+      const vals = plan.actions.map(g => rec.results.find(r => r.id === g.id)?.percent || 0);
+      return Math.round(vals.reduce((a,b)=>a+b,0)/vals.length);
+    }
+    function renderQuickStart() { return `<div class="exercise quick-start"><div class="icon">${iconSvg('quick')}</div><div><div class="ex-title">一键训练</div><div class="ex-sub">从当前训练进度开始，按照默认动作顺序一键训练</div></div><button class="btn" onclick="startQuickTraining()">一键开始</button></div>`; }
+    function planSubText(goal) {
+      const patient = getPatient();
+      const rec = patient.records[TODAY];
+      const r = rec?.results.find(x => x.id === goal.id);
+      const a = actions[goal.id];
+      if (a.type === 'quantity') {
+        return `数量评价：${goal.label}${r ? `；已完成 ${r.actual} · ${r.percent}%` : '；今日未开始'}`;
+      }
+      return `质量评价：${goal.label}${r ? `；今日最佳 ${r.actual}` : '；今日未开始'}`;
+    }
+    function renderExerciseCard(actionId, goal = null, source = 'library') {
+      const a = actions[actionId];
+      const sub = goal ? planSubText(goal) : a.defaultSub;
+      return `<div class="exercise"><div class="icon">${a.icon}</div><div><div class="ex-title">${a.name}</div><div class="ex-sub">${sub}</div></div><button class="btn" onclick="openActionDetail('${a.id}', '${source}')">开始训练</button></div>`;
+    }
+    function renderDayCard(record) {
+      const t = scoreTheme(record.score, false);
+      const date = dateObj(record.date);
+      return `<button class="day-card" style="background:linear-gradient(135deg, ${t.bg1}, ${t.bg2}); color:${t.text};" onclick="showDayDetail('${record.date}', '${session.role}')"><div class="date-chip"><div><span>${dayName(record.date)}</span><strong>${date.getDate()}</strong></div></div><div class="metric"><div class="label">总分</div><div class="value">${record.score}</div><div class="metric-tip">点击查看详情</div></div><div class="metric"><div class="label">数量达成</div><div class="value">${record.qty}%</div><div class="metric-tip">踝泵等数量动作</div></div><div class="metric"><div class="label">动作质量</div><div class="value">${record.quality}%</div><div class="metric-tip">角度 / 保持时间</div></div><div class="metric"><div class="label">稳定性</div><div class="value">${record.stability}%</div><div class="metric-tip">动作控制水平</div></div></button>`;
+    }
+    function renderWeekChart(patient) {
+      const days = ['2026-06-04','2026-06-05','2026-06-06','2026-06-07','2026-06-08','2026-06-09','2026-06-10'];
+      const vals = days.map(d => patient.records[d] || { score: 0, qty: 0, quality: 0 });
+      const xs = [38,83,128,173,218,263,308];
+      const y = v => 188 - Math.max(40, Math.min(100, v)) * 1.35;
+      const pScore = vals.map((r,i) => `${xs[i]},${y(r.score).toFixed(1)}`).join(' ');
+      const pQty = vals.map((r,i) => `${xs[i]},${y(r.qty).toFixed(1)}`).join(' ');
+      const pQ = vals.map((r,i) => `${xs[i]},${y(r.quality || r.score).toFixed(1)}`).join(' ');
+      return `<svg width="100%" height="230" viewBox="0 0 330 230"><line x1="38" y1="36" x2="308" y2="36" stroke="#e8f2ef"/><line x1="38" y1="84" x2="308" y2="84" stroke="#e8f2ef"/><line x1="38" y1="132" x2="308" y2="132" stroke="#e8f2ef"/><line x1="38" y1="180" x2="308" y2="180" stroke="#e8f2ef"/><text x="4" y="40" fill="#9ab1ad" font-size="12">100</text><text x="10" y="88" fill="#9ab1ad" font-size="12">80</text><text x="10" y="136" fill="#9ab1ad" font-size="12">60</text><text x="10" y="184" fill="#9ab1ad" font-size="12">40</text><polyline points="${pScore}" fill="none" stroke="#004f57" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><polyline points="${pQty}" fill="none" stroke="#17c291" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><polyline points="${pQ}" fill="none" stroke="#d8ff67" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>${xs.map((xv,i)=>`<circle cx="${xv}" cy="${y(vals[i].score).toFixed(1)}" r="5" fill="#004f57"/>`).join('')}<text x="36" y="214" fill="#9ab1ad" font-size="12">四</text><text x="81" y="214" fill="#9ab1ad" font-size="12">五</text><text x="126" y="214" fill="#9ab1ad" font-size="12">六</text><text x="171" y="214" fill="#9ab1ad" font-size="12">日</text><text x="216" y="214" fill="#9ab1ad" font-size="12">一</text><text x="261" y="214" fill="#9ab1ad" font-size="12">二</text><text x="306" y="214" fill="#9ab1ad" font-size="12">三</text></svg>`;
+    }
+
+    function renderCalendarPage(patient, role) {
+      const title = role === 'therapist' ? `${patient.name} 的训练日历` : '训练日历';
+      return `<section class="page-head"><div><h1>${title}</h1><div class="subtitle">绿色 / 黄色 / 红色表示已训练日期的总分水平；浅色虚线框表示已有运动处方但尚未训练。</div></div><div class="page-actions">${role === 'therapist' ? '<button class="back-btn" onclick="showTherapistView(\'patients\')">切换病人</button>' : ''}${renderSearchBlock()}</div></section><section class="calendar-card"><div class="month-control"><button class="month-btn" onclick="changeMonth(-1)">‹</button><div class="month-title">${currentYear}年${currentMonth}月</div><button class="month-btn" onclick="changeMonth(1)">›</button></div><div class="calendar-grid">${renderCalendarGrid(patient, role)}</div></section>`;
+    }
+    function selectedPatientPill() { const p = patients[selectedPatientId]; return `<span class="pill">当前病人：${p.name}</span>`; }
+    function changeMonth(delta) { currentMonth += delta; if (currentMonth < 1) { currentMonth = 12; currentYear--; } if (currentMonth > 12) { currentMonth = 1; currentYear++; } session.role === 'patient' ? showPatientView('calendar') : showTherapistView('records'); }
+    function renderCalendarGrid(patient, role) {
+      const weeks = ['一','二','三','四','五','六','日'].map(w => `<div class="weekday">${w}</div>`).join('');
+      const first = new Date(currentYear, currentMonth - 1, 1);
+      const startOffset = (first.getDay() + 6) % 7;
+      const daysInMonth = new Date(currentYear, currentMonth, 0).getDate();
+      let cells = '';
+      for (let i = 0; i < startOffset; i++) cells += `<button class="calendar-day outside"><span class="date-num"> </span></button>`;
+      for (let d = 1; d <= daysInMonth; d++) {
+        const date = key(currentYear, currentMonth, d);
+        const plan = getPlan(patient, date);
+        const rec = patient.records[date];
+        const extra = patient.extraRecords[date];
+        const cls = rec ? 'has-record' : plan ? 'has-plan' : '';
+        const theme = rec ? scoreTheme(rec.score, true) : null;
+        const style = rec ? `style="background:linear-gradient(135deg, ${theme.bg1}, ${theme.bg2});"` : '';
+        const clickable = plan || rec ? `onclick="showDayDetail('${date}', '${role}')"` : '';
+        cells += `<button class="calendar-day ${cls}" ${style} ${clickable}><span class="date-num">${d}</span><span class="day-tags">${rec ? `<span class="record-tag">总分 ${rec.score}</span>` : ''}${plan ? `<span class="plan-tag">处方 ${plan.actions.length}项</span>` : ''}</span><span class="score-mini">${plan ? plan.template : '暂无处方'}</span></button>`;
+      }
+      return weeks + cells;
+    }
+
+    function showDayDetail(date, role = session.role) {
+      const patient = role === 'therapist' ? patients[selectedPatientId] : getPatient();
+      document.getElementById('content').innerHTML = renderDayDetail(patient, date, role);
+      setActive(role === 'therapist' ? 'records' : 'calendar');
+      bindSearch();
+    }
+    function renderDayDetail(patient, date, role) {
+      const plan = getPlan(patient, date);
+      const rec = patient.records[date];
+      const extra = patient.extraRecords[date] || [];
+      const title = `${date.replaceAll('-', '.')} ${dayName(date)} 训练详情`;
+      const back = role === 'therapist' ? `showTherapistView('records')` : `showPatientView('calendar')`;
+      const summary = rec ? `<div class="summary-grid"><div class="summary-box"><div class="label">总分</div><div class="value">${rec.score}</div></div><div class="summary-box"><div class="label">数量达成</div><div class="value">${rec.qty}%</div></div><div class="summary-box"><div class="label">动作质量</div><div class="value">${rec.quality}%</div></div><div class="summary-box"><div class="label">稳定性</div><div class="value">${rec.stability}%</div></div></div>` : `<div class="summary-grid"><div class="summary-box"><div class="label">训练状态</div><div class="value" style="font-size:24px;">尚未训练</div></div><div class="summary-box"><div class="label">处方动作</div><div class="value">${plan ? plan.actions.length : 0}项</div></div><div class="summary-box"><div class="label">总分</div><div class="value">--</div></div><div class="summary-box"><div class="label">记录</div><div class="value">待完成</div></div></div>`;
+      const prescriptionRows = plan ? plan.actions.map(g => `<div class="record-row"><div class="record-icon">${actions[g.id].icon}</div><div><div class="record-name">${actions[g.id].name}</div><div class="record-desc">${goalLine(g)}</div></div><div class="record-result">处方内</div></div>`).join('') : '<div class="ex-sub">当天不在运动处方范围内。</div>';
+      const results = rec ? rec.results.map(r => `<div class="record-row"><div class="record-icon">${actions[r.id].icon}</div><div><div class="record-name">${actions[r.id].name}</div><div class="record-desc">${r.note}</div></div><div class="record-result">${r.actual}<br><span class="ex-sub">${r.counted ? '计入总分' : '不计入总分'}</span></div></div>`).join('') : '<div class="ex-sub">还没有完成记录。未来日期会先展示处方，训练完成后这里会显示实际完成情况。</div>';
+      const extraRows = extra.length ? `<div class="analysis-item"><strong>额外训练记录</strong><p>${extra.map(e => `${actions[e.id].name}：${e.actual}。${e.note}`).join('；')}</p></div>` : '';
+      const nextStep = rec ? (rec.score >= 85 ? '整体完成情况较好，可以继续保持当前处方节奏，并在无明显疼痛的前提下逐步增加质量动作。' : rec.score >= 70 ? '完成情况中等，建议优先补足数量动作，并在质量动作中减少代偿。' : '当天训练完成偏少，建议先保证基础数量动作，不要急于增加高难度动作。') : '训练前请确认摄像头角度和床旁空间，按照处方顺序完成即可。';
+      const therapistAdvice = rec ? (rec.score >= 85 ? '建议继续保持当前训练频率。若夜间肿胀或疼痛没有增加，下一阶段可在康复师确认后增加屈膝活动度训练。' : rec.score >= 70 ? '建议把数量类动作分散到早、中、晚三段完成；质量类动作优先追求动作稳定，不需要为了追求角度而代偿。' : '建议今天先补齐踝泵和等长收缩等基础动作。若疼痛、肿胀明显或无法完成处方，请及时联系康复师调整训练量。') : '请按当天处方完成训练；若训练中出现明显疼痛、头晕或伤口不适，请暂停并联系康复师。';
+      return `<section class="page-head"><div><h1>${title}</h1><div class="subtitle">${role === 'therapist' ? `病人：${patient.name} · ` : ''}${plan ? plan.template : '暂无处方'}</div></div><div class="page-actions"><button class="back-btn" onclick="${back}">返回</button>${renderSearchBlock()}</div></section><section class="detail-card">${summary}<div class="detail-layout"><div class="prescription-box"><h2>当天训练处方</h2>${prescriptionRows}</div><div class="record-list"><h2>当天完成情况</h2>${results}</div></div><div class="detail-layout" style="margin-top:20px;"><div class="analysis-box"><h2>加总分析</h2><div class="analysis-item"><strong>数量动作</strong><p>${rec ? `踝泵、股四头肌等长收缩和腘绳肌等长收缩的综合达成率为 ${rec.qty}%。系统建议把数量动作拆分到上午、下午和晚上完成，避免一次性训练过久。` : '当天尚未训练，数量动作会按照处方目标记录完成次数。'}</p></div><div class="analysis-item"><strong>质量动作</strong><p>${rec ? `质量类动作平均得分为 ${rec.quality}%。系统会重点观察角度、保持时间和膝关节控制情况。` : '当天尚未训练，质量动作会在训练后记录最佳角度、保持时间和稳定性。'}</p></div>${extraRows}</div><div class="analysis-box"><h2>康复建议</h2><div class="analysis-item"><strong>下一步</strong><p>${nextStep}</p></div><div class="analysis-item"><strong>康复师建议</strong><p>${therapistAdvice}</p></div></div></div></section>`;
+    }
+
+    function renderActionLibrary(role) {
+      return `<section class="page-head"><div><h1>全部训练动作</h1><div class="subtitle">这里展示动作库中的全部 8 个动作。今天处方中未出现的动作也可以从这里进入；若额外完成，会记录但不计入当天总分。</div></div><div class="page-actions">${renderSearchBlock()}</div></section><section class="plan-card"><div class="action-grid">${Object.values(actions).map(a => renderExerciseCard(a.id, null, 'library')).join('')}</div></section>`;
+    }
+    function openActionDetail(actionId, source = 'library') {
+      closeSearch();
+      document.getElementById('content').innerHTML = renderActionDetail(actionId, source);
+      setActive(session.role === 'patient' ? 'actions' : 'stats');
+      bindSearch();
+    }
+    function renderActionDetail(actionId, source) {
+      const patient = getPatient();
+      const a = actions[actionId];
+      const inTodayPlan = isPrescribed(patient, TODAY, actionId);
+      const plan = getPlan(patient, TODAY);
+      const goal = plan?.actions.find(g => g.id === actionId);
+      const back = session.role === 'patient' ? `showPatientView('${source === 'plan' ? 'dashboard' : 'actions'}')` : `showTherapistView('${lastTherapistView}')`;
+      return `<section class="page-head"><div><h1>${a.name}</h1><div class="subtitle">${inTodayPlan ? '今日处方内动作，完成后计入今日总分。' : '未在今日处方内，完成后会如实记录，但不计入今日总分和加总指标。'}</div></div><div class="page-actions"><button class="back-btn" onclick="${back}">返回</button>${renderSearchBlock()}</div></section><section class="action-detail-grid"><div class="action-intro"><div class="action-title-row"><div class="icon">${a.icon}</div><div><h2>${a.shortName}</h2><div class="action-subtitle">${a.type === 'quantity' ? '数量评价动作' : '质量评价动作'} · ${goal ? goal.label : a.defaultSub}</div></div></div><p class="intro-paragraph">${a.intro}</p><div class="standard-list"><div class="standard-item"><strong>考核重点：</strong>${a.criteria}</div>${a.standard.map(s => `<div class="standard-item"><strong>完成标准：</strong>${s}</div>`).join('')}<div class="standard-item"><strong>训练好处：</strong>${a.benefits.join('、')}。</div></div><div class="pill-row"><span class="pill">${inTodayPlan ? '处方内' : '额外训练'}</span><span class="pill">${a.type === 'quantity' ? '按次数记录' : '按角度 / 时间记录'}</span></div><div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:22px;"><button class="btn" onclick="simulateComplete('${actionId}')">模拟完成本次训练</button><button class="btn secondary" onclick="startCameraHint()">检查摄像头位置</button></div></div><div class="media-grid"><div class="media-box" id="demoVideoBox"><span class="media-label">示范视频预留区</span><div class="media-placeholder"><span class="big">▶️</span><strong>${a.shortName}示范视频</strong><p>后续可接入治疗师录制的视频或标准动作视频。鼠标移入画面右下角可进入全屏。</p></div><button class="fullscreen-btn" onclick="enterFullscreen(this.closest('.media-box'))">进入全屏</button></div><div class="media-box camera" id="cameraBox"><span class="media-label">实时拍摄与后台处理结果</span><div class="media-placeholder"><span class="big">🎥</span><strong>摄像头实时画面 / 骨架识别叠加</strong><p>这里预留给 OpenCV + MediaPipe 后台处理后的实时画面，可显示关键点、目标角度线和动作提示。</p></div><button class="fullscreen-btn" onclick="enterFullscreen(this.closest('.media-box'))">进入全屏</button></div></div></section>`;
+    }
+    function enterFullscreen(el) {
+      if (!el) return;
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      if (fsEl === el) {
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        return;
+      }
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    }
+    function updateFullscreenButtons() {
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      document.querySelectorAll('.fullscreen-btn').forEach(btn => {
+        btn.textContent = fsEl && btn.closest('.media-box') === fsEl ? '退出全屏' : '进入全屏';
+      });
+    }
+    document.addEventListener('fullscreenchange', updateFullscreenButtons);
+    document.addEventListener('webkitfullscreenchange', updateFullscreenButtons);
+    function simulateComplete(actionId) {
+      const patient = getPatient();
+      const rec = patient.records[TODAY] || { date: TODAY, score: null, qty: 0, quality: 0, stability: 0, results: [] };
+      const inPlan = isPrescribed(patient, TODAY, actionId);
+      const a = actions[actionId];
+      const result = makeActionResult(actionId, inPlan ? 90 : 0, a.type === 'quantity' ? '模拟完成 1 组' : '模拟完成 1 次最佳质量', inPlan ? '本次模拟记录计入处方完成情况' : '该动作未在今日处方内，已记录但不计入总分', inPlan);
+      if (inPlan) {
+        rec.results = rec.results.filter(r => r.id !== actionId).concat(result);
+        patient.records[TODAY] = rec;
+      } else {
+        patient.extraRecords[TODAY] = (patient.extraRecords[TODAY] || []).filter(r => r.id !== actionId).concat(result);
+      }
+      showToast(inPlan ? `${a.shortName}已模拟完成，并计入今日处方记录` : `${a.shortName}已作为额外训练记录，不计入总分`);
+    }
+    function startCameraHint() { showToast('Demo 中暂未接入摄像头；真实版本可在这里启动识别程序。'); }
+    function startQuickTraining() { showToast('一键训练会按今日处方顺序进入动作识别流程；Demo 中暂不串联真实识别。'); }
+
+    function renderPatientSettings() {
+      const u = session;
+      const p = getPatient();
+      return `<section class="page-head"><div><h1>账户设置</h1><div class="subtitle">查看当前患者账号状态，也可以退出登录返回登录界面。</div></div></section><section class="account-card"><div class="account-layout"><div class="avatar">${u.avatar || p.avatar}</div><div class="account-info"><h2>${u.name || p.name}</h2><div class="ex-sub">账号：${u.username} · 类型：患者账号 · 康复师：${p.therapist}</div><div class="status-pill"><span class="dot"></span>当前已登录</div><div><button class="btn dark" onclick="logout()">登出账户</button></div></div></div></section>`;
+    }
+
+    function renderTherapistPatients() {
+      return `<section class="page-head"><div><h1>病人管理</h1><div class="subtitle">查看所有已注册病人，选择病人后可以进入处方分配、完成记录和统计概览。</div></div></section><section class="soft-card"><div class="patient-grid">${Object.values(patients).map(p => { const latest = latestRecord(p); return `<button class="patient-card ${selectedPatientId === p.id ? 'active' : ''}" onclick="selectPatient('${p.id}')"><div class="patient-avatar">${p.avatar}</div><h3>${p.name}</h3><p>${p.diagnosis}</p><div class="pill-row"><span class="pill">最近总分 ${latest ? latest.score : '--'}</span><span class="pill">本月处方 ${Object.keys(p.prescriptions).length} 天</span></div></button>`; }).join('')}</div></section>`;
+    }
+    function latestRecord(p) { return Object.values(p.records).sort((a,b)=>a.date.localeCompare(b.date)).pop(); }
+    function selectPatient(id) { selectedPatientId = id; showToast(`已切换到病人：${patients[id].name}`); showTherapistView('patients'); }
+    const prescriptionTemplates = {
+      early: { name: '术后早期基础模板', actions: () => [makeGoal('ankle_pump', 600, '目标 600 次'), makeGoal('quadriceps_isometric', 300, '目标 300 次'), makeGoal('hamstring_isometric', 300, '目标 300 次')] },
+      straight_raise: { name: '基础 + 直腿抬高模板', actions: () => [makeGoal('ankle_pump', 800, '目标 800 次'), makeGoal('quadriceps_isometric', 400, '目标 400 次'), makeGoal('hamstring_isometric', 400, '目标 400 次'), makeGoal('supine_straight_leg_raise', 15, '目标抬腿 15°，保持 1.5 秒')] },
+      flexion: { name: '屈膝活动度进阶模板', actions: () => [makeGoal('ankle_pump', 1000, '目标 1000 次'), makeGoal('quadriceps_isometric', 500, '目标 500 次'), makeGoal('hamstring_isometric', 500, '目标 500 次'), makeGoal('supine_straight_leg_raise', 15, '目标抬腿 15°，保持 1.5 秒'), makeGoal('supine_knee_flexion', 110, '目标屈膝 110°，保持 6 秒')] },
+      comprehensive: { name: '综合力量与活动度模板', actions: () => [makeGoal('ankle_pump', 1000, '目标 1000 次'), makeGoal('quadriceps_isometric', 500, '目标 500 次'), makeGoal('hamstring_isometric', 500, '目标 500 次'), makeGoal('supine_straight_leg_raise', 15, '目标抬腿 15°，保持 1.5 秒'), makeGoal('side_lying_hip_abduction', 12, '目标侧抬 12°，保持 1.5 秒'), makeGoal('prone_hip_extension', 12, '目标后抬 12°，保持 1 秒'), makeGoal('supine_knee_flexion', 120, '目标屈膝 120°，保持 6 秒'), makeGoal('bed_knee_flexion', 10, '最大位保持 10 秒')] }
+    };
+    function addDays(date, delta) {
+      const d = dateObj(date);
+      d.setDate(d.getDate() + delta);
+      return key(d.getFullYear(), d.getMonth() + 1, d.getDate());
+    }
+    function renderTherapistAssign() {
+      const p = patients[selectedPatientId];
+      const pageSize = Math.max(1, Math.min(31, Number(assignState.pageSize) || 7));
+      const rows = Array.from({ length: pageSize }, (_, i) => addDays(assignState.startDate, i)).map(date => {
+        const plan = getPlan(p, date);
+        return `<tr><td><div class="assign-date"><strong>${date}</strong><div class="ex-sub">${dayName(date)}</div></div></td><td>${plan ? plan.template : '暂无模板'}</td><td><div class="action-chips">${plan ? plan.actions.map(g => `<span class="action-chip">${actions[g.id].shortName} · ${g.label}</span>`).join('') : ''}</div></td><td><button class="btn secondary" onclick="mockEditPrescription('${date}')">调整</button></td></tr>`;
+      }).join('');
+      const options = Object.entries(prescriptionTemplates).map(([id, t]) => `<option value="${id}" ${assignState.template === id ? 'selected' : ''}>${t.name}</option>`).join('');
+      return `<section class="page-head"><div><h1>${p.name} 的处方分配</h1><div class="subtitle">可基于固定模板快速开具和调整未来训练日程。</div></div><div class="page-actions"><button class="back-btn" onclick="showTherapistView('patients')">切换病人</button></div></section><section class="soft-card"><div class="assign-toolbar"><div class="assign-field"><label>选择处方模板</label><select id="assignTemplateSelect">${options}</select></div><div class="assign-field"><label>开始训练日期</label><input id="assignStartDate" type="date" value="${assignState.startDate}" /></div><div class="assign-field"><label>每页最多显示天数</label><input id="assignPageSize" type="number" min="1" max="31" value="${pageSize}" /></div><button class="btn" onclick="applyPrescriptionChanges()">应用更改</button></div><div class="table-wrap"><table class="assign-table"><thead><tr><th>日期</th><th>处方模板</th><th>动作与目标</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+    }
+    function applyPrescriptionChanges() {
+      const p = patients[selectedPatientId];
+      const templateId = document.getElementById('assignTemplateSelect')?.value || assignState.template;
+      const startDate = document.getElementById('assignStartDate')?.value || assignState.startDate;
+      const pageSize = Math.max(1, Math.min(31, Number(document.getElementById('assignPageSize')?.value || assignState.pageSize)));
+      assignState = { template: templateId, startDate, pageSize };
+      const template = prescriptionTemplates[templateId] || prescriptionTemplates.straight_raise;
+      for (let i = 0; i < pageSize; i++) {
+        const date = addDays(startDate, i);
+        p.prescriptions[date] = { date, template: template.name, actions: template.actions() };
+      }
+      currentYear = Number(startDate.slice(0, 4));
+      currentMonth = Number(startDate.slice(5, 7));
+      showToast(`已为 ${p.name} 从 ${startDate} 起应用 ${template.name}，共 ${pageSize} 天。`);
+      showTherapistView('records');
+    }
+    function applyTemplate(name) { assignState.template = name; applyPrescriptionChanges(); }
+    function mockEditPrescription(date) { showToast(`${date} 的处方调整入口已预留；真实版本可在弹窗中增删动作和目标。`); }
+    function renderTherapistStats() {
+      const p = patients[selectedPatientId];
+      const records = Object.values(p.records).sort((a,b)=>a.date.localeCompare(b.date)).slice(-3);
+      return `<section class="page-head"><div><h1>${p.name} 的康复统计</h1><div class="subtitle">查看过去三天的完成情况和过去一周的变化趋势。</div></div><div class="page-actions"><button class="back-btn" onclick="showTherapistView('patients')">切换病人</button></div></section><section class="grid"><div class="history">${records.map(renderDayCard).join('')}</div><aside class="panel"><h2>过去一周统计</h2><div class="chart-wrap">${renderWeekChart(p)}</div><div class="legend"><span><i class="main-l"></i>总分</span><span><i class="num-l"></i>数量套组</span><span><i class="quality-l"></i>质量套组</span></div></aside></section>`;
+    }
+    function renderTherapistSettings() {
+      return `<section class="page-head"><div><h1>康复师账户设置</h1><div class="subtitle">查看当前康复师账号状态，也可以退出登录。</div></div></section><section class="account-card"><div class="account-layout"><div class="avatar">${session.avatar}</div><div class="account-info"><h2>${session.name}</h2><div class="ex-sub">账号：${session.username} · 类型：康复师账号 · 已管理病人 ${Object.keys(patients).length} 人</div><div class="status-pill"><span class="dot"></span>当前已登录</div><div><button class="btn dark" onclick="logout()">登出账户</button></div></div></div></section>`;
+    }
+
+    function showToast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(showToast.timer);
+      showToast.timer = setTimeout(() => el.classList.remove('show'), 2600);
+    }
+  </script>
+</body>
+</html>
