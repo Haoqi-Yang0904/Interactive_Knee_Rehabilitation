@@ -19,6 +19,8 @@ urllib3<2
 matplotlib==3.9.4
 
 # Backend API runtime
+Flask>=3.0,<4
+cryptography>=42
 fastapi>=0.112
 uvicorn[standard]>=0.30
 sqlalchemy>=2.0,<2.1

@@ -303,7 +303,7 @@
         </div>
         <div class="form-title" id="authTitle">登录系统</div>
         <div class="form-sub" id="authSub">输入演示账号和密码进入对应界面，也可以直接使用下面的快速入口。</div>
-        <div class="field"><label>账号</label><input id="usernameInput" value="patient" placeholder="请输入账号" /></div>
+        <div class="field"><label>账号</label><input id="usernameInput" value="liming" placeholder="请输入账号" /></div>
         <div class="field"><label>密码</label><input id="passwordInput" type="password" value="123456" placeholder="请输入密码" /></div>
         <div class="field" id="roleField" style="display:none;"><label>注册账号类型</label><select id="registerRole"><option value="patient">患者账号</option><option value="therapist">康复师账号</option></select></div>
         <button class="login-btn" id="authSubmitBtn" onclick="submitAuth()">登录</button>
@@ -311,7 +311,7 @@
           <button onclick="quickLogin('patient')">患者端 Demo</button>
           <button onclick="quickLogin('therapist')">康复师端 Demo</button>
         </div>
-        <div class="hint-box">演示账号：患者 <b>patient / 123456</b>；康复师 <b>therapist / 123456</b>。注册新账号会临时加入当前 Demo，不连接真实后端。</div>
+        <div class="hint-box">演示账号：患者 <b>liming / 123456</b>、<b>zhangmin / 123456</b>、<b>chenhao / 123456</b>；康复师 <b>therapist / 123456</b>。启动本地服务后数据会写入 SQLite。</div>
       </div>
     </div>
   </section>
@@ -323,13 +323,13 @@
   <div id="toast" class="toast"></div>
 
   <script>
-    const TODAY = '2026-06-11';
+    let TODAY = '2026-06-15';
     let authMode = 'login';
     let session = null;
     let selectedPatientId = 'p001';
     let currentYear = 2026;
     let currentMonth = 6;
-    let assignState = { startDate: '2026-06-11', pageSize: 7, template: 'straight_raise' };
+    let assignState = { startDate: '2026-06-15', pageSize: 7, template: 'straight_raise' };
     let lastPatientView = 'dashboard';
     let lastTherapistView = 'patients';
 
@@ -416,12 +416,12 @@
       }
     };
 
-    const users = {
+    let users = {
       patient: { username: 'patient', password: '123456', role: 'patient', patientId: 'p001', name: '李明', avatar: '🧑‍🦽' },
       therapist: { username: 'therapist', password: '123456', role: 'therapist', name: '王康复师', avatar: '👩‍⚕️' }
     };
 
-    const patients = {
+    let patients = {
       p001: { id: 'p001', name: '李明', avatar: '🧑‍🦽', age: 62, diagnosis: '左膝关节置换术后第 11 天', therapist: '王康复师', prescriptions: {}, records: {}, extraRecords: {} },
       p002: { id: 'p002', name: '张敏', avatar: '🧑‍💼', age: 57, diagnosis: '右膝半月板术后康复期', therapist: '王康复师', prescriptions: {}, records: {}, extraRecords: {} },
       p003: { id: 'p003', name: '陈浩', avatar: '🧑', age: 68, diagnosis: '膝关节置换术后早期', therapist: '王康复师', prescriptions: {}, records: {}, extraRecords: {} }
@@ -486,6 +486,63 @@
 
     initDemoData();
 
+    let apiAvailable = false;
+    let apiToken = localStorage.getItem('rehabLocalToken') || '';
+    const apiTemplateMap = {
+      early: 'week1_basic',
+      straight_raise: 'week2_straight_raise',
+      flexion: 'week3_flexion_progress',
+      comprehensive: 'week4_comprehensive'
+    };
+
+    async function apiRequest(path, options = {}) {
+      const headers = { ...(options.headers || {}) };
+      let body = options.body;
+      if (body !== undefined && !(body instanceof FormData) && typeof body !== 'string') {
+        headers['Content-Type'] = 'application/json';
+        body = JSON.stringify(body);
+      }
+      if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
+      const res = await fetch(path, { ...options, headers, body });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || payload.ok === false) throw new Error(payload.error || res.statusText || '本地 API 请求失败');
+      return payload.data;
+    }
+
+    function applyRemoteState(state) {
+      if (!state) return;
+      if (state.demoToday) {
+        TODAY = state.demoToday;
+        assignState.startDate = TODAY;
+        currentYear = Number(TODAY.slice(0, 4));
+        currentMonth = Number(TODAY.slice(5, 7));
+      }
+      if (state.users) users = state.users;
+      if (state.patients) patients = state.patients;
+      if (state.defaultPatientId && !patients[selectedPatientId]) selectedPatientId = state.defaultPatientId;
+    }
+
+    async function syncRemoteState(render = false) {
+      try {
+        const state = await apiRequest('/api/demo-state');
+        applyRemoteState(state);
+        apiAvailable = true;
+        if (render && session) renderCurrentSessionView();
+        return true;
+      } catch (err) {
+        apiAvailable = false;
+        return false;
+      }
+    }
+
+    function renderCurrentSessionView() {
+      renderShell();
+      if (session?.role === 'patient') showPatientView(lastPatientView || 'dashboard');
+      else if (session?.role === 'therapist') showTherapistView(lastTherapistView || 'patients');
+    }
+
+    syncRemoteState();
+
     function hexToRgb(hex) {
       const h = hex.replace('#', '');
       return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
@@ -530,10 +587,27 @@
       document.getElementById('authSub').textContent = mode === 'login' ? '输入演示账号和密码进入对应界面，也可以直接使用下面的快速入口。' : '选择账号类型并设置账号密码，注册后会直接进入对应端的 Demo 界面。';
       document.getElementById('authSubmitBtn').textContent = mode === 'login' ? '登录' : '注册并登录';
     }
-    function submitAuth() {
+    async function submitAuth() {
       const username = document.getElementById('usernameInput').value.trim();
       const password = document.getElementById('passwordInput').value;
       if (!username || !password) return showToast('请输入账号和密码');
+      try {
+        const endpoint = authMode === 'register' ? '/api/register' : '/api/login';
+        const payload = authMode === 'register'
+          ? { username, password, role: document.getElementById('registerRole').value }
+          : { username, password };
+        const data = await apiRequest(endpoint, { method: 'POST', body: payload });
+        apiAvailable = true;
+        apiToken = data.token || '';
+        if (apiToken) localStorage.setItem('rehabLocalToken', apiToken);
+        if (data.state) applyRemoteState(data.state);
+        else await syncRemoteState(false);
+        await setSession(data.user);
+        showToast(authMode === 'register' ? '注册成功，已进入本地 Demo' : '登录成功，已连接本地数据');
+        return;
+      } catch (err) {
+        if (apiAvailable) return showToast(err.message || '本地 API 登录失败');
+      }
       if (authMode === 'register') {
         const role = document.getElementById('registerRole').value;
         if (users[username]) return showToast('该账号已存在，请换一个账号名');
@@ -545,19 +619,26 @@
         } else {
           users[username] = { username, password, role, name: username, avatar: '👩‍⚕️' };
         }
-        setSession(users[username]);
+        await setSession(users[username]);
       } else {
-        const user = users[username];
+        const fallbackUsername = username === 'liming' ? 'patient' : username;
+        const user = users[fallbackUsername];
         if (!user || user.password !== password) return showToast('账号或密码不正确');
-        setSession(user);
+        await setSession(user);
       }
     }
-    function quickLogin(role) { setSession(role === 'patient' ? users.patient : users.therapist); }
-    function setSession(user) {
+    async function quickLogin(role) {
+      document.getElementById('usernameInput').value = role === 'patient' ? 'liming' : 'therapist';
+      document.getElementById('passwordInput').value = '123456';
+      if (authMode !== 'login') switchAuthMode('login');
+      await submitAuth();
+    }
+    async function setSession(user) {
       session = user;
       if (user.role === 'patient') selectedPatientId = user.patientId;
       document.getElementById('loginScreen').style.display = 'none';
       document.getElementById('app').style.display = 'grid';
+      await syncRemoteState(false);
       renderShell();
       if (user.role === 'patient') showPatientView('dashboard'); else showTherapistView('patients');
     }
@@ -565,7 +646,9 @@
       session = null;
       document.getElementById('app').style.display = 'none';
       document.getElementById('loginScreen').style.display = 'grid';
-      document.getElementById('usernameInput').value = 'patient';
+      apiToken = '';
+      localStorage.removeItem('rehabLocalToken');
+      document.getElementById('usernameInput').value = 'liming';
       document.getElementById('passwordInput').value = '123456';
       showToast('已退出登录');
     }
@@ -667,7 +750,7 @@
       return `<button class="day-card" style="background:linear-gradient(135deg, ${t.bg1}, ${t.bg2}); color:${t.text};" onclick="showDayDetail('${record.date}', '${session.role}')"><div class="date-chip"><div><span>${dayName(record.date)}</span><strong>${date.getDate()}</strong></div></div><div class="metric"><div class="label">总分</div><div class="value">${record.score}</div><div class="metric-tip">点击查看详情</div></div><div class="metric"><div class="label">数量达成</div><div class="value">${record.qty}%</div><div class="metric-tip">踝泵等数量动作</div></div><div class="metric"><div class="label">动作质量</div><div class="value">${record.quality}%</div><div class="metric-tip">角度 / 保持时间</div></div><div class="metric"><div class="label">稳定性</div><div class="value">${record.stability}%</div><div class="metric-tip">动作控制水平</div></div></button>`;
     }
     function renderWeekChart(patient) {
-      const days = ['2026-06-04','2026-06-05','2026-06-06','2026-06-07','2026-06-08','2026-06-09','2026-06-10'];
+      const days = Array.from({ length: 7 }, (_, i) => addDays(TODAY, i - 6));
       const vals = days.map(d => patient.records[d] || { score: 0, qty: 0, quality: 0 });
       const xs = [38,83,128,173,218,263,308];
       const y = v => 188 - Math.max(40, Math.min(100, v)) * 1.35;
@@ -762,8 +845,22 @@
     }
     document.addEventListener('fullscreenchange', updateFullscreenButtons);
     document.addEventListener('webkitfullscreenchange', updateFullscreenButtons);
-    function simulateComplete(actionId) {
+    async function simulateComplete(actionId) {
       const patient = getPatient();
+      if (apiAvailable) {
+        try {
+          const data = await apiRequest('/api/training/start', {
+            method: 'POST',
+            body: { patient_id: patient.id, date: TODAY, action_id: actionId, mock: true }
+          });
+          applyRemoteState(data.state);
+          renderCurrentSessionView();
+          showToast(`${actions[actionId].shortName}已写入本地训练记录`);
+          return;
+        } catch (err) {
+          showToast(err.message || '本地训练记录写入失败，已回退到前端模拟');
+        }
+      }
       const rec = patient.records[TODAY] || { date: TODAY, score: null, qty: 0, quality: 0, stability: 0, results: [] };
       const inPlan = isPrescribed(patient, TODAY, actionId);
       const a = actions[actionId];
@@ -777,7 +874,25 @@
       showToast(inPlan ? `${a.shortName}已模拟完成，并计入今日处方记录` : `${a.shortName}已作为额外训练记录，不计入总分`);
     }
     function startCameraHint() { showToast('Demo 中暂未接入摄像头；真实版本可在这里启动识别程序。'); }
-    function startQuickTraining() { showToast('一键训练会按今日处方顺序进入动作识别流程；Demo 中暂不串联真实识别。'); }
+    async function startQuickTraining() {
+      const patient = getPatient();
+      if (apiAvailable) {
+        try {
+          const data = await apiRequest('/api/training/start', {
+            method: 'POST',
+            body: { patient_id: patient.id, date: TODAY, mode: 'one_click', mock: true }
+          });
+          applyRemoteState(data.state);
+          renderCurrentSessionView();
+          showToast('已按今日处方顺序写入一键训练模拟记录');
+          return;
+        } catch (err) {
+          showToast(err.message || '本地一键训练失败');
+          return;
+        }
+      }
+      showToast('一键训练会按今日处方顺序进入动作识别流程；请先启动本地 API 后写入 SQLite。');
+    }
 
     function renderPatientSettings() {
       const u = session;
@@ -811,12 +926,33 @@
       const options = Object.entries(prescriptionTemplates).map(([id, t]) => `<option value="${id}" ${assignState.template === id ? 'selected' : ''}>${t.name}</option>`).join('');
       return `<section class="page-head"><div><h1>${p.name} 的处方分配</h1><div class="subtitle">可基于固定模板快速开具和调整未来训练日程。</div></div><div class="page-actions"><button class="back-btn" onclick="showTherapistView('patients')">切换病人</button></div></section><section class="soft-card"><div class="assign-toolbar"><div class="assign-field"><label>选择处方模板</label><select id="assignTemplateSelect">${options}</select></div><div class="assign-field"><label>开始训练日期</label><input id="assignStartDate" type="date" value="${assignState.startDate}" /></div><div class="assign-field"><label>每页最多显示天数</label><input id="assignPageSize" type="number" min="1" max="31" value="${pageSize}" /></div><button class="btn" onclick="applyPrescriptionChanges()">应用更改</button></div><div class="table-wrap"><table class="assign-table"><thead><tr><th>日期</th><th>处方模板</th><th>动作与目标</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
     }
-    function applyPrescriptionChanges() {
+    async function applyPrescriptionChanges() {
       const p = patients[selectedPatientId];
       const templateId = document.getElementById('assignTemplateSelect')?.value || assignState.template;
       const startDate = document.getElementById('assignStartDate')?.value || assignState.startDate;
       const pageSize = Math.max(1, Math.min(31, Number(document.getElementById('assignPageSize')?.value || assignState.pageSize)));
       assignState = { template: templateId, startDate, pageSize };
+      if (apiAvailable) {
+        try {
+          const data = await apiRequest('/api/therapist/assign-template', {
+            method: 'POST',
+            body: {
+              patient_id: selectedPatientId,
+              template_id: apiTemplateMap[templateId] || templateId,
+              start_date: startDate,
+              days: pageSize
+            }
+          });
+          applyRemoteState(data.state);
+          currentYear = Number(startDate.slice(0, 4));
+          currentMonth = Number(startDate.slice(5, 7));
+          showToast(`已为 ${p.name} 从 ${startDate} 起应用处方模板，共 ${pageSize} 天。`);
+          showTherapistView('records');
+          return;
+        } catch (err) {
+          showToast(err.message || '本地处方分配失败，已回退到前端模拟');
+        }
+      }
       const template = prescriptionTemplates[templateId] || prescriptionTemplates.straight_raise;
       for (let i = 0; i < pageSize; i++) {
         const date = addDays(startDate, i);

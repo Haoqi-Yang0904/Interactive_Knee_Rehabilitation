@@ -30,6 +30,7 @@ build/
 # Auto-generated pose screenshots
 test_pose.jpg
 test_pose/
+rehab_local_data/
 
 # Auto-generated test audio
 edge_test.mp3
