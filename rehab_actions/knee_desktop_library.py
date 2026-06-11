@@ -9,11 +9,10 @@ VISUAL_TARGET_HOLD_SECONDS = 1.5
 SIDE_REMAINING_EXERCISE_IDS = (
     "quadriceps_isometric",
     "hamstring_isometric",
-    "sandbag_knee_extension_press",
-    "bed_knee_flexion",
     "side_lying_hip_abduction",
     "prone_hip_extension",
-    "side_lying_hip_adduction",
+    "supine_knee_flexion",
+    "bed_knee_flexion",
 )
 
 
@@ -60,10 +59,6 @@ def _isometric_phases() -> list[TimerPhase]:
         TimerPhase("主动收紧保持", "收紧。", 5.0),
         TimerPhase("放松", "放松。", 2.0),
     ]
-
-
-def _single_hold_phase(label: str, cue: str, seconds: float) -> list[TimerPhase]:
-    return [TimerPhase(label, cue, seconds)]
 
 
 def ankle_pump(target_units: int) -> Exercise:
@@ -119,24 +114,6 @@ def hamstring_isometric(target_units: int) -> Exercise:
     )
 
 
-def sandbag_knee_extension_press(target_units: int) -> Exercise:
-    return Exercise(
-        id="sandbag_knee_extension_press",
-        name="沙袋压腿",
-        category="床上锻炼",
-        mode="timer",
-        target_units=1,
-        standard=[
-            "脚跟垫软物使腿悬空。",
-            "3-5 公斤沙袋压于膝关节上。",
-            "每次 15 分钟，过程中不要让膝盖弯曲。",
-        ],
-        setup=["侧面拍摄，确认髋、膝、小腿末端可见，膝关节保持伸直。"],
-        voice_cues=["保持。"],
-        timer_phases=_single_hold_phase("沙袋压腿保持", "保持。", 15 * 60.0),
-    )
-
-
 def supine_straight_leg_raise(target_units: int) -> Exercise:
     return Exercise(
         id="supine_straight_leg_raise",
@@ -170,7 +147,7 @@ def side_lying_hip_abduction(target_units: int) -> Exercise:
             "骨盆和躯干保持稳定，不向后倒。",
             "抬起和放下都要慢。",
         ],
-        setup=["侧卧位，让摄像头能看到髋、膝、踝，起始位停 1 秒。"],
+        setup=["请侧躺在床面上，患侧腿在上，健侧腿在下，脸朝向镜头；让摄像头能看到髋、膝、踝。"],
         voice_cues=["抬起。", "保持。", "放下。"],
         visual_up_threshold=0.12,
         visual_down_threshold=0.05,
@@ -191,7 +168,7 @@ def prone_hip_extension(target_units: int) -> Exercise:
             "抬到约 12 度即可，不要拱腰。",
             "慢慢放下，动作稳定。",
         ],
-        setup=["俯卧位，侧方拍到髋、膝、踝；识别时需脚踝清晰。"],
+        setup=["请俯卧在床上，让患侧腿朝向镜头；侧方拍到髋、膝、踝，识别时需脚踝清晰。"],
         voice_cues=["抬起。", "保持。", "放下。"],
         visual_up_threshold=0.12,
         visual_down_threshold=0.04,
@@ -201,24 +178,23 @@ def prone_hip_extension(target_units: int) -> Exercise:
     )
 
 
-def side_lying_hip_adduction(target_units: int) -> Exercise:
+def supine_knee_flexion(target_units: int) -> Exercise:
     return Exercise(
-        id="side_lying_hip_adduction",
-        name="内收抬腿练习",
-        category="肌力练习",
-        mode="visual",
+        id="supine_knee_flexion",
+        name="仰卧屈膝",
+        category="床上锻炼",
+        mode="flexion_visual",
         target_units=target_units,
         standard=[
-            "侧卧，患腿伸直，向身体中线方向抬起。",
-            "大腿内侧发力，骨盆不要扭转。",
-            "幅度不用大，慢慢放下。",
+            "仰卧或坐位，患肢缓慢屈膝到约 120 度。",
+            "达标后保持 6 秒，过程中身体不要晃。",
+            "缓慢伸直回到起始位，疼痛明显就先停。",
         ],
-        setup=["侧卧位，调整身体让患腿在画面中清楚可见。"],
-        voice_cues=["抬起。", "保持。", "放下。"],
-        visual_up_threshold=0.10,
+        setup=["侧面拍摄，完整看到髋、膝和小腿末端；先伸直患腿建立起始位。"],
+        voice_cues=["弯曲。", "保持。", "伸直。"],
         visual_down_threshold=0.04,
-        target_movement_degrees=10.0,
-        target_hold_seconds=1.5,
+        target_flexion_degrees=120.0,
+        target_hold_seconds=6.0,
     )
 
 
@@ -230,14 +206,13 @@ def bed_knee_flexion(target_units: int) -> Exercise:
         mode="flexion_visual",
         target_units=target_units,
         standard=[
-            "仰卧或坐位，患肢缓慢弯曲到可承受最大限度。",
-            "到达目标后保持 10 秒。",
-            "缓慢放松回到伸直起始位。",
+            "仰卧，先把大腿往上抬到最大限度。",
+            "保持大腿位置，再屈膝，把小腿往大腿方向收到最大限度。",
+            "最大位稳定后保持 10 秒，再慢慢放回起始位。",
         ],
-        setup=["侧面拍摄，完整看到髋、膝和小腿末端；先伸直患腿建立起始位。"],
-        voice_cues=["弯曲。", "保持。", "伸直。"],
+        setup=["仰卧，侧面拍摄，完整看到髋、膝和脚踝；膝盖开始时不要求完全伸直。"],
+        voice_cues=["先抬大腿。", "保持大腿位置，屈膝。", "保持。", "慢慢放回。"],
         visual_down_threshold=0.04,
-        target_flexion_degrees=70.0,
         target_hold_seconds=10.0,
     )
 
@@ -247,12 +222,11 @@ def build_exercises(target_units: int) -> list[Exercise]:
         ankle_pump(target_units),
         quadriceps_isometric(target_units),
         hamstring_isometric(target_units),
-        sandbag_knee_extension_press(target_units),
         supine_straight_leg_raise(target_units),
-        bed_knee_flexion(target_units),
         side_lying_hip_abduction(target_units),
         prone_hip_extension(target_units),
-        side_lying_hip_adduction(target_units),
+        supine_knee_flexion(target_units),
+        bed_knee_flexion(target_units),
     ]
 
 
@@ -307,6 +281,13 @@ def collect_short_voice_texts(exercises: list[Exercise]) -> list[str]:
         "未检测到下肢。",
         "训练完成。",
         "已重置。",
+        "请侧躺在床面上，患侧腿在上，健侧腿在下，脸朝向镜头。",
+        "请俯卧在床上，让患侧腿朝向镜头。",
+        "请仰卧，先把大腿往上抬到最大限度，然后屈膝，把小腿往大腿方向收。",
+        "先抬大腿。",
+        "保持大腿位置，屈膝。",
+        "屈膝。",
+        "慢慢放回。",
     }
     for exercise in exercises:
         texts.add(f"{exercise.name}。")

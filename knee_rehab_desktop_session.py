@@ -6,9 +6,8 @@ This script runs a complete knee rehab training sequence with OpenCV,
 MediaPipe pose landmarks, and local cached voice prompts:
 
 ankle pump -> quadriceps isometric -> hamstring isometric ->
-sandbag knee extension press -> supine straight leg raise ->
-bed knee flexion -> straight-leg knee flexion -> side lying hip abduction ->
-prone hip extension -> side lying hip adduction -> summary.
+supine straight leg raise -> side lying hip abduction ->
+prone hip extension -> supine knee flexion -> bed knee flexion -> summary.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ import sys
 import time
 import warnings
 from collections import deque
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
@@ -77,11 +76,12 @@ VISUAL_MISSING_TOLERANCE_FRAMES = 10
 START_STABILITY_RATIO = 0.035
 ISOMETRIC_START_STABILITY_RATIO = 0.07
 KNEE_STRAIGHT_MIN_DEGREES = 150.0
-VISUAL_KNEE_STRAIGHT_MIN_DEGREES = 140.0
+VISUAL_KNEE_STRAIGHT_MIN_DEGREES = 135.0
 VISUAL_KNEE_BASELINE_ALLOWANCE_DEGREES = 16.0
-VISUAL_KNEE_LINE_MAX_RATIO = 0.08
+VISUAL_KNEE_LINE_MAX_RATIO = 0.12
 VISUAL_KNEE_BENT_CONFIRM_SECONDS = 0.9
 VISUAL_KNEE_WARNING_REPEAT_SECONDS = 8.0
+UPPER_LEG_Y_SWITCH_MARGIN = 0.04
 VISUAL_BASELINE_HORIZONTAL_SNAP_MIN_X = 0.55
 VISUAL_TARGET_CONFIRM_SECONDS = 0.25
 VISUAL_HOLD_DROP_RATIO = 0.65
@@ -97,6 +97,13 @@ LOOSE_ISOMETRIC_START_EXERCISE_IDS = {
     "quadriceps_isometric",
     "hamstring_isometric",
 }
+ANGLE_ONLY_VISUAL_EXERCISE_IDS = {
+    "supine_straight_leg_raise",
+    "side_lying_hip_abduction",
+    "prone_hip_extension",
+}
+SIDE_ABDUCTION_SETUP_PROMPT = "请侧躺在床面上，患侧腿在上，健侧腿在下，脸朝向镜头。"
+PRONE_EXTENSION_SETUP_PROMPT = "请俯卧在床上，让患侧腿朝向镜头。"
 VOICE_REPEAT_SECONDS = 5.0
 ANKLE_READY_STABLE_FRAMES = 8
 ANKLE_MIN_CYCLE_SAMPLES = 8
@@ -105,12 +112,19 @@ ANKLE_FILTER_MISSING_TOLERANCE_FRAMES = 5
 ANGLE_STABLE_WINDOW_SECONDS = 0.7
 ANGLE_STABLE_RANGE_DEGREES = 6.0
 ANGLE_TARGET_CONFIRM_SECONDS = 0.35
+BED_MAX_LIFT_MIN_DEGREES = 10.0
+BED_MAX_FLEXION_MIN_DEGREES = 25.0
+BED_HOLD_STABILITY_MAX_RANGE_DEGREES = 8.0
 INTERRUPT_POLL_SECONDS = 0.03
 CAMERA_READ_RETRY_ATTEMPTS = 3
 CAMERA_READ_RETRY_SLEEP_SECONDS = 0.03
 CAMERA_READ_MAX_CONSECUTIVE_FAILURES = 30
 SAPI_SPEAK_ASYNC = 1
 SAPI_PURGE_BEFORE_SPEAK = 2
+LEG_GOOD_COLOR = (80, 220, 120)
+LEG_NEEDS_WORK_COLOR = (0, 220, 255)
+GUIDE_BLUE = (255, 170, 40)
+GUIDE_ARROW_BLUE = (255, 210, 80)
 
 FONT_CANDIDATES = [
     Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "msyh.ttc",
@@ -175,9 +189,13 @@ class ExerciseRuntimeResult:
     status: str
     duration_seconds: float
     warnings: list[str] = field(default_factory=list)
+    metrics: dict[str, object] = field(default_factory=dict)
+    achievement_percent: float | None = None
 
     @property
     def achievement_rate(self) -> float:
+        if self.achievement_percent is not None:
+            return max(0.0, min(float(self.achievement_percent), 100.0))
         if self.target_units <= 0:
             return 0.0
         return min(self.completed_units / self.target_units, 1.0) * 100.0
@@ -847,12 +865,31 @@ def collect_voice_texts(exercises: list[Exercise]) -> list[str]:
     return collect_short_voice_texts(exercises)
 
 
+def visual_setup_prompt(exercise: Exercise) -> str:
+    if exercise.id == "side_lying_hip_abduction":
+        return SIDE_ABDUCTION_SETUP_PROMPT
+    if exercise.id == "prone_hip_extension":
+        return PRONE_EXTENSION_SETUP_PROMPT
+    return "摆好姿势。"
+
+
+def exercise_target_summary(exercise: Exercise) -> str:
+    if exercise.mode in ("timer", "ankle_hybrid"):
+        return f"{exercise.target_units} 次"
+    if exercise.mode == "visual":
+        return f"{exercise.target_units} 回合，记录达标保持时长和最大抬腿角"
+    if exercise.id == "bed_knee_flexion":
+        return f"{exercise.target_units} 回合，记录最大上抬角、最大屈膝角和10秒波动"
+    if exercise.mode == "flexion_visual":
+        return f"{exercise.target_units} 回合，记录是否达标和最大屈膝角"
+    return f"{exercise.target_units} 回合"
+
+
 def build_session_exercises(
     target_units: int,
     *,
     plan: str,
     exercise_ids: list[str] | None = None,
-    sandbag_seconds: float | None = None,
 ) -> list[Exercise]:
     plan_ids = SIDE_REMAINING_EXERCISE_IDS if plan == "side_remaining" else None
     try:
@@ -865,24 +902,6 @@ def build_session_exercises(
         if exercise_ids and plan != "full":
             raise ValueError(f"{exc}。如需单独测试任意动作，请使用 --plan full。") from exc
         raise
-
-    if sandbag_seconds is not None:
-        adjusted_seconds = max(1.0, float(sandbag_seconds))
-        adjusted: list[Exercise] = []
-        for exercise in exercises:
-            if exercise.id == "sandbag_knee_extension_press":
-                adjusted.append(
-                    replace(
-                        exercise,
-                        timer_phases=[
-                            replace(phase, duration_seconds=adjusted_seconds)
-                            for phase in exercise.timer_phases
-                        ],
-                    )
-                )
-            else:
-                adjusted.append(exercise)
-        exercises = adjusted
 
     return exercises
 
@@ -1207,6 +1226,21 @@ def leg_score(landmarks, side: str) -> float:
     return score
 
 
+def upper_leg_y_position(landmarks, side: str) -> float | None:
+    types = leg_landmark_types(side)
+    distal_part = best_distal_part(landmarks, side, require_visible=True)
+    if distal_part is None:
+        return None
+
+    points = []
+    for part in ("hip", "knee", distal_part):
+        point = landmark_normalized_xy(landmarks, types[part])
+        if point is None:
+            return None
+        points.append(point)
+    return float(np.mean([point[1] for point in points]))
+
+
 def leg_is_usable(landmarks, side: str) -> bool:
     types = leg_landmark_types(side)
     distal_part = best_distal_part(landmarks, side, require_visible=True)
@@ -1255,6 +1289,59 @@ def reset_distal_lock(state: TrackedLegState) -> None:
     state.locked_distal_part = None
     state.distal_candidate = None
     state.distal_candidate_frames = 0
+
+
+def choose_upper_leg_side(landmarks, requested_side: str, state: TrackedLegState) -> str | None:
+    if requested_side in ("left", "right"):
+        state.locked_side = requested_side
+        return requested_side
+
+    y_positions = {
+        side: upper_leg_y_position(landmarks, side)
+        for side in ("left", "right")
+    }
+    usable_positions = {
+        side: value
+        for side, value in y_positions.items()
+        if value is not None and leg_is_usable(landmarks, side)
+    }
+    if not usable_positions:
+        return choose_leg_side(landmarks, requested_side, state)
+
+    best_side = min(usable_positions, key=usable_positions.get)
+    locked_side = state.locked_side
+    if locked_side not in ("left", "right") or locked_side not in usable_positions:
+        state.locked_side = best_side
+        state.candidate_side = None
+        state.candidate_frames = 0
+        reset_distal_lock(state)
+        return best_side
+
+    if best_side == locked_side:
+        state.candidate_side = None
+        state.candidate_frames = 0
+        return locked_side
+
+    locked_y = usable_positions[locked_side]
+    best_y = usable_positions[best_side]
+    if locked_y <= best_y + UPPER_LEG_Y_SWITCH_MARGIN:
+        state.candidate_side = None
+        state.candidate_frames = 0
+        return locked_side
+
+    if state.candidate_side == best_side:
+        state.candidate_frames += 1
+    else:
+        state.candidate_side = best_side
+        state.candidate_frames = 1
+
+    if state.candidate_frames >= 2:
+        state.locked_side = best_side
+        state.candidate_side = None
+        state.candidate_frames = 0
+        reset_distal_lock(state)
+        return best_side
+    return locked_side
 
 
 def choose_leg_side(landmarks, requested_side: str, state: TrackedLegState) -> str | None:
@@ -1394,8 +1481,14 @@ def pick_stable_tracked_leg(
     height: int,
     side: str,
     state: TrackedLegState,
+    *,
+    prefer_upper_leg: bool = False,
 ) -> LegPoints | None:
-    tracked_side = choose_leg_side(landmarks, side, state)
+    tracked_side = (
+        choose_upper_leg_side(landmarks, side, state)
+        if prefer_upper_leg
+        else choose_leg_side(landmarks, side, state)
+    )
     if tracked_side is None:
         state.missing_frames += 1
         return None
@@ -1444,9 +1537,18 @@ def knee_line_deviation_ratio(leg: LegPoints) -> float:
     return cross / (length * max(leg.leg_length, 1.0))
 
 
-def straight_leg_raise_angle_degrees(leg: LegPoints) -> float:
+def leg_raise_angle_degrees(leg: LegPoints) -> float:
     distal = leg.ankle if leg.ankle_visible else leg.distal
     vector = distal - leg.hip
+    horizontal = abs(float(vector[0]))
+    upward = max(0.0, -float(vector[1]))
+    if horizontal <= 1e-6 and upward <= 1e-6:
+        return 0.0
+    return math.degrees(math.atan2(upward, max(horizontal, 1e-6)))
+
+
+def thigh_raise_angle_degrees(leg: LegPoints) -> float:
+    vector = leg.knee - leg.hip
     horizontal = abs(float(vector[0]))
     upward = max(0.0, -float(vector[1]))
     if horizontal <= 1e-6 and upward <= 1e-6:
@@ -1618,7 +1720,7 @@ def draw_knee_extension_arrow(frame: np.ndarray, leg: LegPoints) -> None:
         ],
         dtype=np.int32,
     )
-    color = (0, 190, 255)
+    color = GUIDE_ARROW_BLUE
     cv2.polylines(frame, [points], False, color, 4, cv2.LINE_AA)
 
     if len(points) >= 2:
@@ -1635,7 +1737,7 @@ def draw_knee_extension_arrow(frame: np.ndarray, leg: LegPoints) -> None:
     cv2.circle(frame, tuple(np.round(center).astype(int)), 6, (245, 245, 245), -1, cv2.LINE_AA)
 
 
-def draw_straight_leg_raise_guides(
+def draw_angle_only_leg_raise_guides(
     frame: np.ndarray,
     leg: LegPoints | None,
     *,
@@ -1652,8 +1754,15 @@ def draw_straight_leg_raise_guides(
     knee_px = point_to_pixel(leg.knee, frame.shape[1], frame.shape[0])
     distal_px = point_to_pixel(distal, frame.shape[1], frame.shape[0])
 
-    cv2.line(frame, hip_px, knee_px, (80, 220, 120), 4, cv2.LINE_AA)
-    cv2.line(frame, knee_px, distal_px, (80, 220, 120), 4, cv2.LINE_AA)
+    target_reached = (
+        current_angle_degrees is not None
+        and current_angle_degrees >= target_angle_degrees * 0.95
+    )
+    movement_good = target_reached and knee_straight
+    leg_color = LEG_GOOD_COLOR if movement_good else LEG_NEEDS_WORK_COLOR
+
+    cv2.line(frame, hip_px, knee_px, leg_color, 4, cv2.LINE_AA)
+    cv2.line(frame, knee_px, distal_px, leg_color, 4, cv2.LINE_AA)
     for point in (hip_px, knee_px, distal_px):
         cv2.circle(frame, point, 6, (255, 255, 255), -1, cv2.LINE_AA)
 
@@ -1665,18 +1774,20 @@ def draw_straight_leg_raise_guides(
     )
     target_endpoint = leg.hip + target_unit * leg.leg_length
     target_px = point_to_pixel(target_endpoint, frame.shape[1], frame.shape[0])
-    draw_dashed_line(frame, hip_px, target_px, (0, 230, 255), thickness=3)
+    show_guides = not movement_good and stage != "return"
+    if show_guides:
+        draw_dashed_line(frame, hip_px, target_px, GUIDE_BLUE, thickness=3)
 
     if (
-        stage in ("raise", "hold")
-        and current_angle_degrees is not None
-        and current_angle_degrees < target_angle_degrees * 0.95
+        show_guides
+        and stage in ("raise", "hold")
+        and not target_reached
     ):
         cv2.arrowedLine(
             frame,
             distal_px,
             target_px,
-            (0, 255, 170),
+            GUIDE_ARROW_BLUE,
             4,
             cv2.LINE_AA,
             tipLength=0.22,
@@ -1689,8 +1800,8 @@ def draw_straight_leg_raise_guides(
 def draw_flexion_guides(
     frame: np.ndarray,
     leg: LegPoints | None,
-    baseline_distal: np.ndarray | None,
     target_flexion_degrees: float,
+    current_flexion_degrees: float | None,
     stage: str,
 ) -> None:
     if leg is None:
@@ -1700,33 +1811,106 @@ def draw_flexion_guides(
     distal_px = point_to_pixel(leg.distal, w, h)
     hip_px = point_to_pixel(leg.hip, w, h)
 
-    if baseline_distal is not None:
-        base_px = point_to_pixel(baseline_distal, w, h)
-        cv2.line(frame, knee_px, base_px, (255, 170, 60), 2, cv2.LINE_AA)
-        cv2.circle(frame, base_px, 9, (255, 170, 60), 2, cv2.LINE_AA)
+    target_reached = (
+        current_flexion_degrees is not None
+        and current_flexion_degrees >= target_flexion_degrees * 0.95
+    )
+    leg_color = LEG_GOOD_COLOR if target_reached else LEG_NEEDS_WORK_COLOR
+    show_guides = not target_reached and stage != "return"
 
     target = target_distal_for_flexion(leg, target_flexion_degrees)
-    if target is not None:
+    if show_guides and target is not None:
         target_px = point_to_pixel(target, w, h)
-        draw_dashed_line(frame, knee_px, target_px, (0, 230, 255), thickness=3)
-        cv2.circle(frame, target_px, 11, (0, 230, 255), 2, cv2.LINE_AA)
+        draw_dashed_line(frame, knee_px, target_px, GUIDE_BLUE, thickness=3)
+        cv2.circle(frame, target_px, 11, GUIDE_BLUE, 2, cv2.LINE_AA)
         if np.linalg.norm(np.array(target_px) - np.array(distal_px)) > 18:
             cv2.arrowedLine(
                 frame,
                 distal_px,
                 target_px,
-                (0, 255, 170),
+                GUIDE_ARROW_BLUE,
                 4,
                 cv2.LINE_AA,
                 tipLength=0.22,
             )
 
-    cv2.line(frame, hip_px, knee_px, (80, 180, 255), 5, cv2.LINE_AA)
-    cv2.line(frame, knee_px, distal_px, (80, 180, 255), 5, cv2.LINE_AA)
+    cv2.line(frame, hip_px, knee_px, leg_color, 5, cv2.LINE_AA)
+    cv2.line(frame, knee_px, distal_px, leg_color, 5, cv2.LINE_AA)
     cv2.circle(frame, knee_px, 11, (255, 255, 255), -1, cv2.LINE_AA)
-    cv2.circle(frame, knee_px, 14, (80, 180, 255), 2, cv2.LINE_AA)
+    cv2.circle(frame, knee_px, 14, leg_color, 2, cv2.LINE_AA)
     if stage == "hold":
-        cv2.circle(frame, distal_px, 14, (80, 255, 120), 3, cv2.LINE_AA)
+        cv2.circle(frame, distal_px, 14, leg_color, 3, cv2.LINE_AA)
+
+
+def draw_bed_knee_flexion_guides(
+    frame: np.ndarray,
+    leg: LegPoints | None,
+    *,
+    thigh_angle_degrees: float | None,
+    flexion_angle_degrees: float | None,
+    stage: str,
+    stable_position: bool,
+) -> None:
+    if leg is None:
+        return
+
+    h, w = frame.shape[:2]
+    hip_px = point_to_pixel(leg.hip, w, h)
+    knee_px = point_to_pixel(leg.knee, w, h)
+    distal_px = point_to_pixel(leg.distal, w, h)
+    leg_color = LEG_GOOD_COLOR if stable_position else LEG_NEEDS_WORK_COLOR
+
+    cv2.line(frame, hip_px, knee_px, leg_color, 5, cv2.LINE_AA)
+    cv2.line(frame, knee_px, distal_px, leg_color, 5, cv2.LINE_AA)
+    for point in (hip_px, knee_px, distal_px):
+        cv2.circle(frame, point, 6, (255, 255, 255), -1, cv2.LINE_AA)
+
+    if stage == "hold":
+        return
+
+    thigh_length = float(np.linalg.norm(leg.knee - leg.hip))
+    shank_length = float(np.linalg.norm(leg.distal - leg.knee))
+    if thigh_length <= 1e-6 or shank_length <= 1e-6:
+        return
+
+    horizontal_sign = 1.0 if leg.knee[0] >= leg.hip[0] else -1.0
+    horizontal_endpoint = leg.hip + np.array([horizontal_sign, 0.0], dtype=np.float32) * thigh_length
+    draw_dashed_line(frame, hip_px, point_to_pixel(horizontal_endpoint, w, h), GUIDE_BLUE, thickness=2)
+
+    if stage == "lift":
+        base_angle = 0.0 if thigh_angle_degrees is None else thigh_angle_degrees
+        guide_angle = math.radians(min(80.0, max(25.0, base_angle + 18.0)))
+        target = leg.hip + np.array(
+            [horizontal_sign * math.cos(guide_angle), -math.sin(guide_angle)],
+            dtype=np.float32,
+        ) * thigh_length
+        cv2.arrowedLine(
+            frame,
+            knee_px,
+            point_to_pixel(target, w, h),
+            GUIDE_ARROW_BLUE,
+            4,
+            cv2.LINE_AA,
+            tipLength=0.22,
+        )
+    elif stage == "flex":
+        thigh_unit = normalized_vector(leg.hip - leg.knee)
+        shank_unit = normalized_vector(leg.distal - leg.knee)
+        if thigh_unit is None or shank_unit is None:
+            return
+        flexion_hint = max(45.0, min(135.0, (flexion_angle_degrees or 0.0) + 25.0))
+        rotation_sign = guidance_rotation_sign(thigh_unit, shank_unit, leg.side)
+        target_unit = rotate_vector(thigh_unit, rotation_sign * max(10.0, 180.0 - flexion_hint))
+        target = leg.knee + target_unit * shank_length
+        cv2.arrowedLine(
+            frame,
+            distal_px,
+            point_to_pixel(target, w, h),
+            GUIDE_ARROW_BLUE,
+            4,
+            cv2.LINE_AA,
+            tipLength=0.22,
+        )
 
 
 def ankle_foot_angle(leg: LegPoints) -> float | None:
@@ -2377,6 +2561,7 @@ def run_timer_exercise(
     cycle_max_angle: float | None = None
     cycle_angle_samples = 0
     visual_confirmed_cycles = 0
+    best_ankle_angle_range = 0.0
     phase_waiting_for_voice = False
     cycle_ack_pending = False
     phase_paused_at: float | None = None
@@ -2417,11 +2602,13 @@ def run_timer_exercise(
         cycle_max_angle = angle if cycle_max_angle is None else max(cycle_max_angle, angle)
 
     def finish_ankle_cycle_quality() -> None:
-        nonlocal cycle_min_angle, cycle_max_angle, cycle_angle_samples, visual_confirmed_cycles
+        nonlocal cycle_min_angle, cycle_max_angle, cycle_angle_samples
+        nonlocal visual_confirmed_cycles, best_ankle_angle_range
         if exercise.mode != "ankle_hybrid":
             return
         if cycle_min_angle is not None and cycle_max_angle is not None:
             angle_range = cycle_max_angle - cycle_min_angle
+            best_ankle_angle_range = max(best_ankle_angle_range, angle_range)
             if cycle_angle_samples >= ANKLE_MIN_CYCLE_SAMPLES and angle_range >= exercise.target_movement_degrees:
                 visual_confirmed_cycles += 1
             elif completed >= 1:
@@ -2430,6 +2617,32 @@ def run_timer_exercise(
         cycle_max_angle = None
         cycle_angle_samples = 0
         ankle_filter.reset_cycle()
+
+    def timer_quality_metrics() -> dict[str, object]:
+        metrics: dict[str, object] = {
+            "判定标准": "完成数量",
+            "完成次数": completed,
+            "目标次数": exercise.target_units,
+        }
+        if exercise.mode == "ankle_hybrid":
+            metrics.update(
+                {
+                    "目标踝泵角度幅度_deg": round(exercise.target_movement_degrees, 1),
+                    "视觉达标循环数": visual_confirmed_cycles,
+                    "最大踝泵角度幅度_deg": round(best_ankle_angle_range, 1),
+                }
+            )
+        return metrics
+
+    def finish_timer_result(status: str) -> ExerciseRuntimeResult:
+        return finish_result(
+            exercise,
+            completed,
+            status,
+            instruction_start,
+            warnings,
+            metrics=timer_quality_metrics(),
+        )
 
     def active_timer_seconds() -> float:
         if not started or not exercise.timer_phases:
@@ -2708,12 +2921,12 @@ def run_timer_exercise(
 
         key_action = handle_common_keys(key)
         if key_action == "quit":
-            return finish_result(exercise, completed, "quit", instruction_start, warnings)
+            return finish_timer_result("quit")
         if key_action == "skip":
-            return finish_result(exercise, completed, "skipped", instruction_start, warnings)
+            return finish_timer_result("skipped")
 
     if stop_requested():
-        return finish_result(exercise, completed, "quit", instruction_start, warnings)
+        return finish_timer_result("quit")
     if exercise.mode == "ankle_hybrid" and completed > 0 and visual_confirmed_cycles == 0:
         add_warning(warnings, "踝泵视觉幅度未稳定确认")
     key_action = live_preview_until_voice_done(
@@ -2729,9 +2942,9 @@ def run_timer_exercise(
         mirror=mirror,
     )
     if key_action == "quit" or stop_requested():
-        return finish_result(exercise, completed, "quit", instruction_start, warnings)
+        return finish_timer_result("quit")
     if key_action == "skip":
-        return finish_result(exercise, completed, "completed", instruction_start, warnings)
+        return finish_timer_result("completed")
     key_action = speak_with_live_preview(
         cap=cap,
         renderer=renderer,
@@ -2746,10 +2959,10 @@ def run_timer_exercise(
         mirror=mirror,
     )
     if key_action == "quit" or stop_requested():
-        return finish_result(exercise, completed, "quit", instruction_start, warnings)
+        return finish_timer_result("quit")
     if key_action == "skip":
-        return finish_result(exercise, completed, "completed", instruction_start, warnings)
-    return finish_result(exercise, completed, "completed", instruction_start, warnings)
+        return finish_timer_result("completed")
+    return finish_timer_result("completed")
 
 
 def run_visual_exercise(
@@ -2783,20 +2996,29 @@ def run_visual_exercise(
     feedback = "请先摆好起始位，让髋、膝、踝都清楚可见。"
     last_warning_time = 0.0
     last_instruction_time = 0.0
-    is_straight_leg_raise = exercise.id == "supine_straight_leg_raise"
+    is_angle_only_visual = exercise.id in ANGLE_ONLY_VISUAL_EXERCISE_IDS
+    prefer_upper_leg = exercise.id == "side_lying_hip_abduction"
     leg_smoother = LegSmoother(alpha=0.30, max_jump_ratio=0.22)
     tracked_state = TrackedLegState()
     displacement_smoother = ScalarSmoother(alpha=0.25, max_jump=0.10)
     knee_angle_smoother = ScalarSmoother(alpha=0.30, max_jump=18.0)
     knee_line_smoother = ScalarSmoother(alpha=0.25, max_jump=0.10)
     movement_angle_smoother = ScalarSmoother(alpha=0.25, max_jump=12.0)
+    metrics_angle_smoother = ScalarSmoother(alpha=0.25, max_jump=12.0)
     movement_distance_smoother = ScalarSmoother(alpha=0.25, max_jump=12.0)
     consecutive_camera_failures = 0
     voice_gate = VoiceGate(speaker)
+    max_raise_angle = 0.0
+    qualified_hold_seconds = 0.0
+    longest_qualified_hold_seconds = 0.0
+    current_qualified_hold_seconds = 0.0
+    last_quality_sample_time: float | None = None
+    _, _, target_angle_for_metrics = visual_target_for_exercise(exercise, leg_length_cm)
 
     def reset_motion_smoothers() -> None:
         displacement_smoother.reset()
         movement_angle_smoother.reset()
+        metrics_angle_smoother.reset()
         movement_distance_smoother.reset()
 
     def capture_visual_baseline(leg: LegPoints, knee_angle: float) -> None:
@@ -2806,11 +3028,42 @@ def run_visual_exercise(
         baseline_knee_angle = knee_angle
         baseline_axis_unit = visual_baseline_axis_unit(leg)
 
-    voice_gate.start(
-        f"{exercise.name}。",
-        callback=lambda: speaker.speak("摆好姿势。", interrupt=False),
-        feedback="正在播报动作名称，请摆好姿势。",
-        blocks_logic=False,
+    def visual_quality_metrics() -> tuple[dict[str, object], float]:
+        target_total_hold = max(0.0, exercise.target_units * exercise.target_hold_seconds)
+        achievement = (
+            min(qualified_hold_seconds / target_total_hold, 1.0) * 100.0
+            if target_total_hold > 0
+            else 0.0
+        )
+        metrics: dict[str, object] = {
+            "判定标准": "抬腿角度达标保持时长和最大抬腿角度",
+            "目标抬腿角度_deg": round(target_angle_for_metrics, 1),
+            "达标保持目标总时长_s": round(target_total_hold, 1),
+            "达标保持总时长_s": round(qualified_hold_seconds, 1),
+            "最长连续达标保持_s": round(longest_qualified_hold_seconds, 1),
+            "最大抬腿角度_deg": round(max_raise_angle, 1),
+            "完成回合数": completed,
+            "目标回合数": exercise.target_units,
+        }
+        return metrics, achievement
+
+    def finish_visual_result(status: str) -> ExerciseRuntimeResult:
+        metrics, achievement = visual_quality_metrics()
+        return finish_result(
+            exercise,
+            completed,
+            status,
+            start,
+            warnings,
+            metrics=metrics,
+            achievement_percent=achievement,
+        )
+
+    start_voice_sequence(
+        voice_gate,
+        ((f"{exercise.name}。", 0.0), (visual_setup_prompt(exercise), 0.0)),
+        feedback="正在播报体位提示，请摆好姿势。",
+        blocks_logic=True,
     )
 
     while completed < exercise.target_units and not stop_requested():
@@ -2837,7 +3090,7 @@ def run_visual_exercise(
         )
         target_text = (
             f"{target_angle_degrees:.0f} 度"
-            if is_straight_leg_raise
+            if is_angle_only_visual
             else f"{target_angle_degrees:.0f} 度 / {target_distance_cm:.1f} cm"
         )
         hold_text = "--"
@@ -2848,32 +3101,47 @@ def run_visual_exercise(
 
         if not result.pose_landmarks:
             leg_smoother.update(None)
+            last_quality_sample_time = None
+            current_qualified_hold_seconds = 0.0
             feedback = "未检测到人体，请后退半步并完整露出下肢。"
         else:
             h, w = camera_frame.shape[:2]
             side_feedback_text = side_view_feedback(result.pose_landmarks.landmark)
             view_text = side_feedback_text or "侧面：已确认"
-            raw_leg = pick_stable_tracked_leg(result.pose_landmarks.landmark, w, h, side, tracked_state)
+            raw_leg = pick_stable_tracked_leg(
+                result.pose_landmarks.landmark,
+                w,
+                h,
+                side,
+                tracked_state,
+                prefer_upper_leg=prefer_upper_leg,
+            )
             leg = leg_smoother.update(raw_leg)
             display_leg = leg_for_display(leg, w, mirror)
-            if not is_straight_leg_raise:
+            if not is_angle_only_visual:
                 draw_leg(frame, display_leg, draw_thigh=True, draw_shank=True, draw_foot=False)
             tracking_text = tracked_leg_label(leg)
 
             if leg is None:
+                last_quality_sample_time = None
+                current_qualified_hold_seconds = 0.0
                 feedback = "请确保髋、膝、踝三个关键点都清晰可见。"
             else:
                 now = time.monotonic()
                 knee_angle = knee_angle_smoother.update(knee_extension_angle(leg)) or 0.0
                 knee_line_ratio = knee_line_smoother.update(knee_line_deviation_ratio(leg)) or 0.0
                 current_angle_text = f"{knee_angle:.0f} 度 / 偏移 {knee_line_ratio:.2f}"
-                if is_straight_leg_raise:
+                if is_angle_only_visual:
                     current_raise_angle = (
-                        movement_angle_smoother.update(straight_leg_raise_angle_degrees(leg)) or 0.0
+                        movement_angle_smoother.update(leg_raise_angle_degrees(leg)) or 0.0
                     )
+                    max_raise_angle = max(max_raise_angle, current_raise_angle)
                     raw_movement_angle = current_raise_angle
                     movement_angle_text = f"{current_raise_angle:.0f} / {target_angle_degrees:.0f} 度"
-                knee_bent_candidate = knee_line_ratio > VISUAL_KNEE_LINE_MAX_RATIO
+                knee_bent_candidate = (
+                    knee_line_ratio > VISUAL_KNEE_LINE_MAX_RATIO
+                    or knee_angle < VISUAL_KNEE_STRAIGHT_MIN_DEGREES
+                )
                 if knee_bent_candidate:
                     if knee_bent_started_at is None:
                         knee_bent_started_at = now
@@ -2882,6 +3150,25 @@ def run_visual_exercise(
                     knee_bent_started_at = None
                     knee_bent_confirmed = False
                 knee_straight = not knee_bent_confirmed
+                if is_angle_only_visual:
+                    qualified_now = (
+                        current_raise_angle is not None
+                        and current_raise_angle >= target_angle_degrees * 0.95
+                        and knee_straight
+                        and stage in ("raise", "hold")
+                    )
+                    if last_quality_sample_time is not None:
+                        sample_delta = min(max(0.0, now - last_quality_sample_time), 0.2)
+                        if qualified_now:
+                            qualified_hold_seconds += sample_delta
+                            current_qualified_hold_seconds += sample_delta
+                            longest_qualified_hold_seconds = max(
+                                longest_qualified_hold_seconds,
+                                current_qualified_hold_seconds,
+                            )
+                        else:
+                            current_qualified_hold_seconds = 0.0
+                    last_quality_sample_time = now
 
                 if baseline_ankle is not None:
                     raw_motion_metrics = visual_motion_metrics(
@@ -2894,17 +3181,17 @@ def run_visual_exercise(
                     )
                     if raw_motion_metrics is not None:
                         raw_displacement = raw_motion_metrics.movement_ratio
-                        if not is_straight_leg_raise:
+                        if not is_angle_only_visual:
                             raw_movement_angle = raw_motion_metrics.angle_degrees
                     motion_metrics = smooth_visual_metrics(
                         raw_motion_metrics,
                         ratio_smoother=displacement_smoother,
-                        angle_smoother=movement_angle_smoother,
+                        angle_smoother=metrics_angle_smoother,
                         distance_smoother=movement_distance_smoother,
                     )
                     if motion_metrics is not None:
                         displacement = motion_metrics.movement_ratio
-                        if not is_straight_leg_raise:
+                        if not is_angle_only_visual:
                             movement_angle_text = (
                                 f"{motion_metrics.angle_degrees:.0f} / "
                                 f"{motion_metrics.target_angle_degrees:.0f} 度"
@@ -2916,7 +3203,7 @@ def run_visual_exercise(
                     else:
                         raw_displacement = relative_ankle_displacement(leg, baseline_ankle, baseline_hip)
                         displacement = displacement_smoother.update(raw_displacement) or raw_displacement
-                        if not is_straight_leg_raise:
+                        if not is_angle_only_visual:
                             raw_movement_angle = 0.0
                 else:
                     displacement = 0.0
@@ -2925,8 +3212,8 @@ def run_visual_exercise(
                 display_baseline_ankle = mirror_point_for_display(baseline_ankle, w, mirror)
                 display_baseline_hip = mirror_point_for_display(baseline_hip, w, mirror)
                 display_metrics = visual_metrics_for_display(motion_metrics, w, mirror)
-                if is_straight_leg_raise:
-                    draw_straight_leg_raise_guides(
+                if is_angle_only_visual:
+                    draw_angle_only_leg_raise_guides(
                         frame,
                         display_leg,
                         target_angle_degrees=target_angle_degrees,
@@ -3002,7 +3289,7 @@ def run_visual_exercise(
                             feedback = "请先稳定起始位，不要急着抬。"
 
                     elif stage == "raise":
-                        if is_straight_leg_raise:
+                        if is_angle_only_visual:
                             target_reached = (
                                 current_raise_angle is not None
                                 and current_raise_angle >= target_angle_degrees * 0.95
@@ -3053,7 +3340,7 @@ def run_visual_exercise(
                                 last_instruction_time = now
 
                     elif stage == "hold":
-                        if is_straight_leg_raise:
+                        if is_angle_only_visual:
                             hold_drop_threshold = max(
                                 VISUAL_RETURN_MIN_ANGLE_DEGREES,
                                 target_angle_degrees * VISUAL_HOLD_DROP_RATIO,
@@ -3086,7 +3373,7 @@ def run_visual_exercise(
                                 feedback = "检测到短暂偏低，请抬回目标线。"
                         else:
                             hold_drop_started_at = None
-                            if is_straight_leg_raise:
+                            if is_angle_only_visual:
                                 hold_threshold = target_angle_degrees * 0.85
                                 below_hold_threshold = (
                                     current_raise_angle is not None
@@ -3135,7 +3422,7 @@ def run_visual_exercise(
                             (motion_metrics.target_angle_degrees if motion_metrics is not None else target_angle_degrees)
                             * VISUAL_RETURN_ANGLE_FRACTION,
                         )
-                        if is_straight_leg_raise:
+                        if is_angle_only_visual:
                             return_ready = (
                                 current_raise_angle is not None
                                 and current_raise_angle <= return_angle_threshold
@@ -3196,7 +3483,7 @@ def run_visual_exercise(
                                     speaker.speak(f"完成 {completed} 次。")
                         else:
                             return_started_at = None
-                            if is_straight_leg_raise:
+                            if is_angle_only_visual:
                                 angle_for_feedback = 0.0 if current_raise_angle is None else current_raise_angle
                                 feedback = (
                                     "慢慢放回起始位。"
@@ -3222,11 +3509,13 @@ def run_visual_exercise(
             view_text,
             f"膝关节内角：{current_angle_text}",
             f"抬高角：{movement_angle_text}",
+            f"最大抬高角：{max_raise_angle:.0f} 度",
+            f"达标保持：{qualified_hold_seconds:.1f} 秒",
             f"目标：{target_text}",
             f"保持时间：{hold_text}",
             "按 r 可重置起始位",
         ]
-        if not is_straight_leg_raise:
+        if not is_angle_only_visual:
             extra_lines.insert(5, f"离床距离：{distance_text}")
         frame = render_training_frame(
             renderer=renderer,
@@ -3242,9 +3531,9 @@ def run_visual_exercise(
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
         if key_action == "quit":
-            return finish_result(exercise, completed, "quit", start, warnings)
+            return finish_visual_result("quit")
         if key_action == "skip":
-            return finish_result(exercise, completed, "skipped", start, warnings)
+            return finish_visual_result("skipped")
         if key == ord("r"):
             voice_gate.cancel(stop_voice=True)
             baseline_ankle = None
@@ -3267,7 +3556,7 @@ def run_visual_exercise(
             speaker.speak("已重置。")
 
     if stop_requested():
-        return finish_result(exercise, completed, "quit", start, warnings)
+        return finish_visual_result("quit")
     key_action = live_preview_until_voice_done(
         cap=cap,
         renderer=renderer,
@@ -3281,9 +3570,9 @@ def run_visual_exercise(
         mirror=mirror,
     )
     if key_action == "quit" or stop_requested():
-        return finish_result(exercise, completed, "quit", start, warnings)
+        return finish_visual_result("quit")
     if key_action == "skip":
-        return finish_result(exercise, completed, "completed", start, warnings)
+        return finish_visual_result("completed")
     key_action = speak_with_live_preview(
         cap=cap,
         renderer=renderer,
@@ -3298,10 +3587,10 @@ def run_visual_exercise(
         mirror=mirror,
     )
     if key_action == "quit" or stop_requested():
-        return finish_result(exercise, completed, "quit", start, warnings)
+        return finish_visual_result("quit")
     if key_action == "skip":
-        return finish_result(exercise, completed, "completed", start, warnings)
-    return finish_result(exercise, completed, "completed", start, warnings)
+        return finish_visual_result("completed")
+    return finish_visual_result("completed")
 
 
 def run_flexion_visual_exercise(
@@ -3343,6 +3632,9 @@ def run_flexion_visual_exercise(
     lift_target_started_at: float | None = None
     consecutive_camera_failures = 0
     voice_gate = VoiceGate(speaker)
+    max_flexion_angle = 0.0
+    target_reached_reps = 0
+    rep_target_counted = False
 
     voice_gate.start(
         f"{exercise.name}。",
@@ -3350,6 +3642,34 @@ def run_flexion_visual_exercise(
         feedback="正在播报动作名称，请摆好姿势。",
         blocks_logic=False,
     )
+
+    def flexion_quality_metrics() -> tuple[dict[str, object], float]:
+        achievement = (
+            min(max_flexion_angle / max(target_flexion, 1.0), 1.0) * 100.0
+        )
+        target_met = max_flexion_angle >= target_flexion * 0.95
+        metrics: dict[str, object] = {
+            "判定标准": "是否达到预设弯曲角度和最大屈膝角度",
+            "目标屈膝角度_deg": round(target_flexion, 1),
+            "最大屈膝角度_deg": round(max_flexion_angle, 1),
+            "是否达到目标屈膝角": target_met,
+            "屈膝角达标次数": target_reached_reps,
+            "完成回合数": completed,
+            "目标回合数": exercise.target_units,
+        }
+        return metrics, achievement
+
+    def finish_flexion_result(status: str) -> ExerciseRuntimeResult:
+        metrics, achievement = flexion_quality_metrics()
+        return finish_result(
+            exercise,
+            completed,
+            status,
+            start,
+            warnings,
+            metrics=metrics,
+            achievement_percent=achievement,
+        )
 
     while completed < exercise.target_units and not stop_requested():
         camera_frame = read_camera_frame(cap)
@@ -3380,8 +3700,6 @@ def run_flexion_visual_exercise(
             raw_leg = pick_stable_tracked_leg(result.pose_landmarks.landmark, w, h, side, tracked_state)
             leg = leg_smoother.update(raw_leg)
             display_leg = leg_for_display(leg, w, mirror)
-            display_baseline_distal = mirror_point_for_display(baseline_distal, w, mirror)
-            draw_flexion_guides(frame, display_leg, display_baseline_distal, target_flexion, stage)
             tracking_text = tracked_leg_label(leg)
 
             if leg is None:
@@ -3389,8 +3707,16 @@ def run_flexion_visual_exercise(
             else:
                 now = time.monotonic()
                 flexion = flexion_smoother.update(knee_flexion_angle(leg)) or 0.0
+                max_flexion_angle = max(max_flexion_angle, flexion)
                 flexion_stable = flexion_stability.update(flexion, now)
                 flexion_text = f"{flexion:.0f}/{target_flexion:.0f} 度"
+                draw_flexion_guides(
+                    frame,
+                    display_leg,
+                    target_flexion,
+                    flexion,
+                    stage,
+                )
 
                 if baseline_distal is not None and baseline_hip is not None:
                     baseline_vector = baseline_distal - baseline_hip
@@ -3514,8 +3840,12 @@ def run_flexion_visual_exercise(
                     if flexion_ready:
                         def begin_flexion_hold() -> None:
                             nonlocal stage, hold_started_at, stage_started_at, feedback
+                            nonlocal target_reached_reps, rep_target_counted
                             if stop_requested():
                                 return
+                            if not rep_target_counted:
+                                target_reached_reps += 1
+                                rep_target_counted = True
                             stage = "hold"
                             hold_started_at = time.monotonic()
                             stage_started_at = hold_started_at
@@ -3584,6 +3914,7 @@ def run_flexion_visual_exercise(
                             lift_stability.reset()
                             flexion_target_started_at = None
                             lift_target_started_at = None
+                            rep_target_counted = False
                             hold_started_at = None
                             return_started_at = None
                             if completed < exercise.target_units:
@@ -3636,6 +3967,7 @@ def run_flexion_visual_exercise(
                 tracking_text,
                 view_text,
                 f"屈膝角：{flexion_text}",
+                f"最大屈膝角：{max_flexion_angle:.0f} 度",
                 f"上抬角：{lift_text}" if needs_lift else "",
                 f"保持时间：{hold_text}",
                 "按 r 可重置起始位",
@@ -3645,9 +3977,9 @@ def run_flexion_visual_exercise(
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
         if key_action == "quit":
-            return finish_result(exercise, completed, "quit", start, warnings)
+            return finish_flexion_result("quit")
         if key_action == "skip":
-            return finish_result(exercise, completed, "skipped", start, warnings)
+            return finish_flexion_result("skipped")
         if key == ord("r"):
             voice_gate.cancel(stop_voice=True)
             baseline_distal = None
@@ -3664,11 +3996,12 @@ def run_flexion_visual_exercise(
             lift_stability.reset()
             flexion_target_started_at = None
             lift_target_started_at = None
+            rep_target_counted = False
             feedback = "已重置起始位，请伸直患腿。"
             speaker.speak("已重置。")
 
     if stop_requested():
-        return finish_result(exercise, completed, "quit", start, warnings)
+        return finish_flexion_result("quit")
     key_action = live_preview_until_voice_done(
         cap=cap,
         renderer=renderer,
@@ -3682,9 +4015,9 @@ def run_flexion_visual_exercise(
         mirror=mirror,
     )
     if key_action == "quit" or stop_requested():
-        return finish_result(exercise, completed, "quit", start, warnings)
+        return finish_flexion_result("quit")
     if key_action == "skip":
-        return finish_result(exercise, completed, "completed", start, warnings)
+        return finish_flexion_result("completed")
     key_action = speak_with_live_preview(
         cap=cap,
         renderer=renderer,
@@ -3699,10 +4032,470 @@ def run_flexion_visual_exercise(
         mirror=mirror,
     )
     if key_action == "quit" or stop_requested():
-        return finish_result(exercise, completed, "quit", start, warnings)
+        return finish_flexion_result("quit")
     if key_action == "skip":
-        return finish_result(exercise, completed, "completed", start, warnings)
-    return finish_result(exercise, completed, "completed", start, warnings)
+        return finish_flexion_result("completed")
+    return finish_flexion_result("completed")
+
+
+def angle_range_degrees(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return max(values) - min(values)
+
+
+def run_bed_knee_flexion_exercise(
+    *,
+    cap: cv2.VideoCapture,
+    pose,
+    renderer: TextRenderer,
+    speaker: Speaker,
+    exercise: Exercise,
+    exercise_index: int,
+    total_exercises: int,
+    side: str,
+    mirror: bool,
+    reaction_seconds: float,
+) -> ExerciseRuntimeResult:
+    start = time.monotonic()
+    completed = 0
+    warnings: list[str] = []
+    stage: Literal["setup", "lift", "flex", "hold", "return"] = "setup"
+    stage_started_at = time.monotonic()
+    hold_started_at: float | None = None
+    return_started_at: float | None = None
+    lift_stable_started_at: float | None = None
+    flexion_stable_started_at: float | None = None
+    baseline_knee: np.ndarray | None = None
+    baseline_distal: np.ndarray | None = None
+    feedback = "请仰卧，侧面完整露出髋、膝和脚踝。"
+    last_instruction_time = 0.0
+
+    tracked_state = TrackedLegState()
+    leg_smoother = LegSmoother(alpha=0.35, max_jump_ratio=0.22)
+    thigh_smoother = ScalarSmoother(alpha=0.30, max_jump=16.0)
+    flexion_smoother = ScalarSmoother(alpha=0.30, max_jump=18.0)
+    thigh_stability = AngleStabilityTracker(max_range_degrees=5.0)
+    flexion_stability = AngleStabilityTracker()
+    voice_gate = VoiceGate(speaker)
+    consecutive_camera_failures = 0
+
+    session_max_thigh_angle = 0.0
+    session_max_flexion_angle = 0.0
+    rep_max_thigh_angle = 0.0
+    rep_max_flexion_angle = 0.0
+    hold_thigh_samples: list[float] = []
+    hold_flexion_samples: list[float] = []
+    hold_records: list[dict[str, object]] = []
+
+    start_voice_sequence(
+        voice_gate,
+        (
+            (f"{exercise.name}。", 0.0),
+            ("请仰卧，先把大腿往上抬到最大限度，然后屈膝，把小腿往大腿方向收。", 0.0),
+        ),
+        feedback="正在播报床上弯腿动作说明，请摆好姿势。",
+        blocks_logic=True,
+    )
+
+    def reset_rep_angles() -> None:
+        nonlocal rep_max_thigh_angle, rep_max_flexion_angle
+        nonlocal hold_thigh_samples, hold_flexion_samples
+        rep_max_thigh_angle = 0.0
+        rep_max_flexion_angle = 0.0
+        hold_thigh_samples = []
+        hold_flexion_samples = []
+        thigh_smoother.reset()
+        flexion_smoother.reset()
+        thigh_stability.reset()
+        flexion_stability.reset()
+
+    def record_hold() -> None:
+        nonlocal hold_records
+        thigh_range = angle_range_degrees(hold_thigh_samples)
+        flexion_range = angle_range_degrees(hold_flexion_samples)
+        stable = (
+            thigh_range <= BED_HOLD_STABILITY_MAX_RANGE_DEGREES
+            and flexion_range <= BED_HOLD_STABILITY_MAX_RANGE_DEGREES
+        )
+        hold_records.append(
+            {
+                "回合": completed + 1,
+                "大腿最大上抬角_deg": round(rep_max_thigh_angle, 1),
+                "最大屈膝角_deg": round(rep_max_flexion_angle, 1),
+                "保持期大腿角波动_deg": round(thigh_range, 1),
+                "保持期屈膝角波动_deg": round(flexion_range, 1),
+                "保持期稳定": stable,
+            }
+        )
+
+    def bed_quality_metrics() -> tuple[dict[str, object], float]:
+        stable_reps = sum(1 for record in hold_records if bool(record.get("保持期稳定")))
+        max_thigh_range = max(
+            (float(record.get("保持期大腿角波动_deg", 0.0)) for record in hold_records),
+            default=0.0,
+        )
+        max_flexion_range = max(
+            (float(record.get("保持期屈膝角波动_deg", 0.0)) for record in hold_records),
+            default=0.0,
+        )
+        achievement = min(stable_reps / max(1, exercise.target_units), 1.0) * 100.0
+        metrics: dict[str, object] = {
+            "判定标准": "大腿最大上抬角、最大屈膝角、保持10秒内角度波动和稳定性",
+            "完成回合数": completed,
+            "目标回合数": exercise.target_units,
+            "保持目标时长_s": round(exercise.target_hold_seconds, 1),
+            "稳定判定最大波动_deg": round(BED_HOLD_STABILITY_MAX_RANGE_DEGREES, 1),
+            "大腿最大上抬角_deg": round(session_max_thigh_angle, 1),
+            "最大屈膝角_deg": round(session_max_flexion_angle, 1),
+            "最大保持期大腿角波动_deg": round(max_thigh_range, 1),
+            "最大保持期屈膝角波动_deg": round(max_flexion_range, 1),
+            "稳定保持回合数": stable_reps,
+            "保持记录": hold_records,
+        }
+        return metrics, achievement
+
+    def finish_bed_result(status: str) -> ExerciseRuntimeResult:
+        metrics, achievement = bed_quality_metrics()
+        return finish_result(
+            exercise,
+            completed,
+            status,
+            start,
+            warnings,
+            metrics=metrics,
+            achievement_percent=achievement,
+        )
+
+    while completed < exercise.target_units and not stop_requested():
+        camera_frame = read_camera_frame(cap)
+        if camera_frame is None:
+            consecutive_camera_failures += 1
+            if consecutive_camera_failures >= CAMERA_READ_MAX_CONSECUTIVE_FAILURES:
+                warnings.append("摄像头连续读取失败")
+                break
+            continue
+        consecutive_camera_failures = 0
+        frame = display_frame_for(camera_frame, mirror)
+        voice_gate.update()
+
+        result = detect_pose(pose, camera_frame)
+        tracking_text = "追踪：--"
+        view_text = "侧面：--"
+        thigh_text = "--"
+        flexion_text = "--"
+        hold_text = "--"
+
+        if not result.pose_landmarks:
+            leg_smoother.update(None)
+            feedback = "未检测到下肢，请侧面进入画面。"
+        else:
+            h, w = camera_frame.shape[:2]
+            side_feedback_text = side_view_feedback(result.pose_landmarks.landmark)
+            view_text = side_feedback_text or "侧面：已确认"
+            raw_leg = pick_stable_tracked_leg(result.pose_landmarks.landmark, w, h, side, tracked_state)
+            leg = leg_smoother.update(raw_leg)
+            display_leg = leg_for_display(leg, w, mirror)
+            tracking_text = tracked_leg_label(leg)
+
+            if leg is None:
+                feedback = "请确保髋、膝和脚踝都清晰可见。"
+            else:
+                now = time.monotonic()
+                thigh_angle = thigh_smoother.update(thigh_raise_angle_degrees(leg)) or 0.0
+                flexion = flexion_smoother.update(knee_flexion_angle(leg)) or 0.0
+                thigh_stable = thigh_stability.update(thigh_angle, now)
+                flexion_stable = flexion_stability.update(flexion, now)
+                session_max_thigh_angle = max(session_max_thigh_angle, thigh_angle)
+                session_max_flexion_angle = max(session_max_flexion_angle, flexion)
+                rep_max_thigh_angle = max(rep_max_thigh_angle, thigh_angle)
+                rep_max_flexion_angle = max(rep_max_flexion_angle, flexion)
+                thigh_text = f"{thigh_angle:.0f} 度 / 最大 {rep_max_thigh_angle:.0f} 度"
+                flexion_text = f"{flexion:.0f} 度 / 最大 {rep_max_flexion_angle:.0f} 度"
+                draw_bed_knee_flexion_guides(
+                    frame,
+                    display_leg,
+                    thigh_angle_degrees=thigh_angle,
+                    flexion_angle_degrees=flexion,
+                    stage=stage,
+                    stable_position=stage == "hold",
+                )
+
+                if voice_gate.blocks_logic:
+                    feedback = voice_gate.feedback
+
+                elif stage == "setup":
+                    if baseline_knee is None or baseline_distal is None:
+                        baseline_knee = leg.knee.copy()
+                        baseline_distal = leg.distal.copy()
+                        stage_started_at = now
+                        feedback = "起始位已找到，请保持不动。"
+                    else:
+                        movement = max(
+                            float(np.linalg.norm(leg.knee - baseline_knee)),
+                            float(np.linalg.norm(leg.distal - baseline_distal)),
+                        ) / max(leg.leg_length, 1.0)
+                        if movement > START_STABILITY_RATIO:
+                            baseline_knee = leg.knee.copy()
+                            baseline_distal = leg.distal.copy()
+                            stage_started_at = now
+                            feedback = "起始位保持不动，准备开始。"
+                        else:
+                            stable_seconds = now - stage_started_at
+                            hold_text = f"{stable_seconds:.1f}/{VISUAL_START_HOLD_SECONDS:.1f} 秒"
+                            feedback = "起始位稳定中，保持住。"
+                            if stable_seconds >= VISUAL_START_HOLD_SECONDS:
+                                def begin_bed_lift() -> None:
+                                    nonlocal stage, stage_started_at, feedback, last_instruction_time
+                                    nonlocal lift_stable_started_at, flexion_stable_started_at
+                                    if stop_requested():
+                                        return
+                                    reset_rep_angles()
+                                    stage = "lift"
+                                    stage_started_at = time.monotonic()
+                                    last_instruction_time = stage_started_at
+                                    lift_stable_started_at = None
+                                    flexion_stable_started_at = None
+                                    feedback = "先把大腿往上抬，抬到自己能达到的最大限度。"
+
+                                start_voice_sequence(
+                                    voice_gate,
+                                    (("准备，开始。", reaction_seconds), ("先抬大腿。", 0.0)),
+                                    final_callback=begin_bed_lift,
+                                    feedback="听口令，口令结束后先抬大腿。",
+                                    blocks_logic=True,
+                                )
+                                feedback = "听口令，口令结束后先抬大腿。"
+
+                elif stage == "lift":
+                    lift_candidate = thigh_angle >= BED_MAX_LIFT_MIN_DEGREES and thigh_stable
+                    if lift_candidate:
+                        if lift_stable_started_at is None:
+                            lift_stable_started_at = now
+                        lift_ready = now - lift_stable_started_at >= ANGLE_TARGET_CONFIRM_SECONDS
+                    else:
+                        lift_stable_started_at = None
+                        lift_ready = False
+
+                    if lift_ready:
+                        def begin_bed_flex() -> None:
+                            nonlocal stage, stage_started_at, feedback, last_instruction_time
+                            nonlocal flexion_stable_started_at
+                            if stop_requested():
+                                return
+                            stage = "flex"
+                            stage_started_at = time.monotonic()
+                            last_instruction_time = stage_started_at
+                            flexion_stable_started_at = None
+                            feedback = "保持大腿位置，慢慢屈膝，把小腿往大腿方向收。"
+
+                        voice_gate.start(
+                            "保持大腿位置，屈膝。",
+                            callback=begin_bed_flex,
+                            feedback="听口令，口令结束后开始屈膝。",
+                            blocks_logic=True,
+                        )
+                        feedback = "听口令，口令结束后开始屈膝。"
+                    else:
+                        feedback = "继续把大腿往上抬，到最大限度后稳住。"
+                        if now - last_instruction_time >= VOICE_REPEAT_SECONDS:
+                            speaker.speak("先抬大腿。", interrupt=False)
+                            last_instruction_time = now
+
+                elif stage == "flex":
+                    flex_candidate = flexion >= BED_MAX_FLEXION_MIN_DEGREES and flexion_stable
+                    if flex_candidate:
+                        if flexion_stable_started_at is None:
+                            flexion_stable_started_at = now
+                        flex_ready = now - flexion_stable_started_at >= ANGLE_TARGET_CONFIRM_SECONDS
+                    else:
+                        flexion_stable_started_at = None
+                        flex_ready = False
+
+                    if flex_ready:
+                        def begin_bed_hold() -> None:
+                            nonlocal stage, stage_started_at, hold_started_at, feedback
+                            nonlocal hold_thigh_samples, hold_flexion_samples
+                            if stop_requested():
+                                return
+                            stage = "hold"
+                            hold_started_at = time.monotonic()
+                            stage_started_at = hold_started_at
+                            hold_thigh_samples = []
+                            hold_flexion_samples = []
+                            feedback = "大腿和屈膝位置已稳定，保持十秒。"
+
+                        voice_gate.start(
+                            "保持。",
+                            callback=begin_bed_hold,
+                            feedback="听口令，口令结束后开始保持。",
+                            blocks_logic=True,
+                        )
+                        feedback = "听口令，口令结束后开始保持。"
+                    else:
+                        feedback = "大腿保持住，继续把小腿往大腿方向收，到最大限度后稳住。"
+                        if now - last_instruction_time >= VOICE_REPEAT_SECONDS:
+                            speaker.speak("屈膝。", interrupt=False)
+                            last_instruction_time = now
+
+                elif stage == "hold":
+                    if hold_started_at is None:
+                        hold_started_at = now
+                    hold_thigh_samples.append(thigh_angle)
+                    hold_flexion_samples.append(flexion)
+                    held_seconds = now - hold_started_at
+                    hold_text = f"{held_seconds:.1f}/{exercise.target_hold_seconds:.1f} 秒"
+                    thigh_range = angle_range_degrees(hold_thigh_samples)
+                    flexion_range = angle_range_degrees(hold_flexion_samples)
+                    feedback = (
+                        f"保持中，还需 {max(0.0, exercise.target_hold_seconds - held_seconds):.1f} 秒。"
+                        f"大腿波动 {thigh_range:.1f} 度，屈膝波动 {flexion_range:.1f} 度。"
+                    )
+                    if held_seconds >= exercise.target_hold_seconds:
+                        record_hold()
+
+                        def begin_bed_return() -> None:
+                            nonlocal stage, return_started_at, stage_started_at, feedback
+                            if stop_requested():
+                                return
+                            stage = "return"
+                            return_started_at = None
+                            stage_started_at = time.monotonic()
+                            feedback = "保持完成，慢慢把腿放回起始位。"
+
+                        voice_gate.start(
+                            "慢慢放回。",
+                            callback=begin_bed_return,
+                            feedback="听口令，口令结束后慢慢放回。",
+                            blocks_logic=True,
+                        )
+                        feedback = "听口令，口令结束后慢慢放回。"
+
+                elif stage == "return":
+                    return_ready = thigh_angle <= 8.0 and flexion <= FLEXION_RETURN_MAX_DEGREES
+                    if return_ready:
+                        if return_started_at is None:
+                            return_started_at = now
+                        return_seconds = now - return_started_at
+                        hold_text = f"{return_seconds:.1f}/{VISUAL_RETURN_HOLD_SECONDS:.1f} 秒"
+                        feedback = "已回到起始位，保持稳定完成计数。"
+                        if return_seconds >= VISUAL_RETURN_HOLD_SECONDS:
+                            completed += 1
+                            baseline_knee = leg.knee.copy()
+                            baseline_distal = leg.distal.copy()
+                            hold_started_at = None
+                            return_started_at = None
+                            lift_stable_started_at = None
+                            flexion_stable_started_at = None
+                            if completed < exercise.target_units:
+                                def begin_next_bed_rep() -> None:
+                                    nonlocal stage, stage_started_at, feedback, last_instruction_time
+                                    if stop_requested():
+                                        return
+                                    reset_rep_angles()
+                                    stage = "lift"
+                                    stage_started_at = time.monotonic()
+                                    last_instruction_time = stage_started_at
+                                    feedback = "继续下一次，先把大腿往上抬到最大限度。"
+
+                                start_voice_sequence(
+                                    voice_gate,
+                                    ((f"完成 {completed} 次。", 0.0), ("先抬大腿。", 0.0)),
+                                    final_callback=begin_next_bed_rep,
+                                    feedback="本次已计数，听口令准备下一次。",
+                                    blocks_logic=True,
+                                )
+                                feedback = "本次已计数，听口令准备下一次。"
+                            else:
+                                speaker.speak(f"完成 {completed} 次。")
+                    else:
+                        return_started_at = None
+                        feedback = "慢慢把大腿放下，并把膝盖伸回起始位。"
+
+        stage_text = {
+            "setup": "起始位确认",
+            "lift": "大腿上抬到最大",
+            "flex": "屈膝到最大",
+            "hold": "最大位保持",
+            "return": "放回起始位",
+        }[stage]
+        frame = render_training_frame(
+            renderer=renderer,
+            frame=frame,
+            exercise=exercise,
+            exercise_index=exercise_index,
+            total_exercises=total_exercises,
+            completed=completed,
+            feedback=feedback,
+            extra_lines=[
+                f"阶段：{stage_text}",
+                tracking_text,
+                view_text,
+                f"大腿上抬角：{thigh_text}",
+                f"屈膝角：{flexion_text}",
+                f"保持时间：{hold_text}",
+                "按 r 可重置起始位",
+            ],
+        )
+        cv2.imshow(WINDOW_NAME, frame)
+        key = poll_training_key(1)
+        key_action = handle_common_keys(key)
+        if key_action == "quit":
+            return finish_bed_result("quit")
+        if key_action == "skip":
+            return finish_bed_result("skipped")
+        if key == ord("r"):
+            voice_gate.cancel(stop_voice=True)
+            baseline_knee = None
+            baseline_distal = None
+            stage = "setup"
+            stage_started_at = time.monotonic()
+            hold_started_at = None
+            return_started_at = None
+            lift_stable_started_at = None
+            flexion_stable_started_at = None
+            tracked_state.reset()
+            leg_smoother.update(None)
+            reset_rep_angles()
+            feedback = "已重置起始位，请仰卧并露出髋、膝、踝。"
+            speaker.speak("已重置。")
+
+    if stop_requested():
+        return finish_bed_result("quit")
+    key_action = live_preview_until_voice_done(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        feedback="本次计数完成，准备播报动作完成。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_bed_result("quit")
+    if key_action == "skip":
+        return finish_bed_result("completed")
+    key_action = speak_with_live_preview(
+        cap=cap,
+        renderer=renderer,
+        speaker=speaker,
+        exercise=exercise,
+        exercise_index=exercise_index,
+        total_exercises=total_exercises,
+        completed=completed,
+        text=f"{exercise.name}完成。",
+        feedback="动作完成，准备切换到下一个动作。",
+        extra_lines=["阶段：动作完成", "画面持续刷新中"],
+        mirror=mirror,
+    )
+    if key_action == "quit" or stop_requested():
+        return finish_bed_result("quit")
+    if key_action == "skip":
+        return finish_bed_result("completed")
+    return finish_bed_result("completed")
 
 
 def add_warning(warnings: list[str], warning: str) -> None:
@@ -3716,6 +4509,9 @@ def finish_result(
     status: str,
     start_time: float,
     warnings: list[str],
+    *,
+    metrics: dict[str, object] | None = None,
+    achievement_percent: float | None = None,
 ) -> ExerciseRuntimeResult:
     return ExerciseRuntimeResult(
         exercise_id=exercise.id,
@@ -3726,6 +4522,8 @@ def finish_result(
         status=status,
         duration_seconds=round(time.monotonic() - start_time, 1),
         warnings=warnings,
+        metrics=metrics or {},
+        achievement_percent=achievement_percent,
     )
 
 
@@ -3744,7 +4542,7 @@ def render_training_frame(
     main_lines = [
         f"{exercise_index + 1}/{total_exercises}  {exercise.name}",
         f"类别：{exercise.category}",
-        f"计数：{completed}/{exercise.target_units}",
+        f"进度：{completed}/{exercise.target_units}",
         feedback,
     ]
     standard_lines = ["动作标准"] + exercise.standard[:3]
@@ -3779,9 +4577,7 @@ def render_summary_frame(
     ]
     detail = ["动作完成情况"]
     for result in results:
-        detail.append(
-            f"{result.exercise_name}：{result.completed_units}/{result.target_units}，{result.status}"
-        )
+        detail.append(f"{result.exercise_name}：{result.achievement_rate:.0f}%，{result.status}")
     return renderer.draw_panels(
         frame,
         [
@@ -3797,11 +4593,84 @@ def create_session_output_dir() -> Path:
     return output_dir
 
 
+def format_metric_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, float):
+        return f"{value:.1f}"
+    if isinstance(value, list):
+        return "；".join(format_metric_value(item) for item in value)
+    if isinstance(value, dict):
+        return "，".join(f"{key}={format_metric_value(item)}" for key, item in value.items())
+    return str(value)
+
+
+def result_metric_summary(result: ExerciseRuntimeResult) -> str:
+    if not result.metrics:
+        return f"完成 {result.completed_units}/{result.target_units}"
+    priority_keys = [
+        "判定标准",
+        "完成次数",
+        "目标次数",
+        "最大踝泵角度幅度_deg",
+        "达标保持总时长_s",
+        "最长连续达标保持_s",
+        "最大抬腿角度_deg",
+        "大腿最大上抬角_deg",
+        "是否达到目标屈膝角",
+        "最大屈膝角度_deg",
+        "最大屈膝角_deg",
+        "最大保持期大腿角波动_deg",
+        "最大保持期屈膝角波动_deg",
+        "稳定保持回合数",
+        "屈膝角达标次数",
+    ]
+    parts = []
+    for key in priority_keys:
+        if key in result.metrics:
+            parts.append(f"{key}={format_metric_value(result.metrics[key])}")
+    return "；".join(parts) if parts else f"完成 {result.completed_units}/{result.target_units}"
+
+
+def write_metrics_text(results: list[ExerciseRuntimeResult], output_path: Path) -> None:
+    lines = [
+        "膝关节康复训练指标记录",
+        f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    for index, result in enumerate(results, start=1):
+        lines.extend(
+            [
+                f"{index}. {result.exercise_name}",
+                f"动作 ID：{result.exercise_id}",
+                f"模式：{result.mode}",
+                f"状态：{result.status}",
+                f"完成进度：{result.completed_units}/{result.target_units}",
+                f"质量完成率：{result.achievement_rate:.1f}%",
+                f"耗时：{result.duration_seconds:.1f} 秒",
+            ]
+        )
+        if result.metrics:
+            lines.append("核心指标：")
+            for key, value in result.metrics.items():
+                lines.append(f"- {key}: {format_metric_value(value)}")
+        else:
+            lines.append("核心指标：未记录")
+        if result.warnings:
+            lines.append("提示/警告：")
+            for warning in result.warnings:
+                lines.append(f"- {warning}")
+        lines.append("")
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def save_results(results: list[ExerciseRuntimeResult]) -> Path:
     output_dir = create_session_output_dir()
     output_path = output_dir / "summary.json"
+    metrics_text_path = output_dir / "metrics_summary.txt"
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "metrics_text": str(metrics_text_path),
         "results": [
             {
                 **asdict(result),
@@ -3811,6 +4680,7 @@ def save_results(results: list[ExerciseRuntimeResult]) -> Path:
         ],
     }
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_metrics_text(results, metrics_text_path)
     return output_path
 
 
@@ -3821,13 +4691,14 @@ def print_summary(results: list[ExerciseRuntimeResult], result_path: Path) -> No
         warnings = "；".join(result.warnings) if result.warnings else "动作质量未记录异常"
         print(
             f"{result.exercise_name}: "
-            f"{result.completed_units}/{result.target_units}, "
             f"{result.achievement_rate:.0f}%, "
             f"{result.status}, "
+            f"{result_metric_summary(result)}, "
             f"{warnings}"
         )
     print("-" * 72)
     print(f"结果已保存：{result_path}")
+    print(f"指标文本已保存：{result_path.with_name('metrics_summary.txt')}")
 
 
 def show_summary_until_quit(
@@ -3870,19 +4741,13 @@ def parse_args() -> argparse.Namespace:
         "--plan",
         choices=["full", "side_remaining"],
         default="full",
-        help="训练计划：full 为完整膝关节计划；side_remaining 为除踝泵和直腿抬高外的侧面动作",
+        help="训练计划：full 为完整膝关节计划；side_remaining 为除踝泵和直腿抬高外的剩余床上/侧面动作",
     )
     parser.add_argument(
         "--exercise",
         action="append",
         default=None,
         help="只运行指定动作 ID；可重复传入，也可用逗号分隔。先用 --list 查看 ID",
-    )
-    parser.add_argument(
-        "--sandbag-seconds",
-        type=float,
-        default=None,
-        help="仅用于测试时覆盖沙袋压腿保持秒数；临床默认仍为 15 分钟",
     )
     parser.add_argument("--no-voice", action="store_true", help="关闭语音播报")
     parser.add_argument("--voice", default=None, help="指定系统语音兜底音色，例如 Windows 的 Huihui 或 macOS 的 Tingting")
@@ -3931,13 +4796,11 @@ def main() -> None:
             target_units,
             plan=args.plan,
             exercise_ids=exercise_ids,
-            sandbag_seconds=args.sandbag_seconds,
         )
         voice_cache_exercises = build_session_exercises(
             max(target_units, DEFAULT_TARGET_UNITS),
             plan=args.plan,
             exercise_ids=exercise_ids,
-            sandbag_seconds=args.sandbag_seconds,
         )
     except ValueError as exc:
         print(exc)
@@ -3954,7 +4817,7 @@ def main() -> None:
         for index, exercise in enumerate(exercises, start=1):
             print(
                 f"{index}. {exercise.id} - {exercise.name} - "
-                f"{exercise.category} - {exercise.mode} - {exercise.target_units} 次"
+                f"{exercise.category} - {exercise.mode} - {exercise_target_summary(exercise)}"
             )
         return
 
@@ -4040,6 +4903,19 @@ def main() -> None:
                     break
                 if exercise.mode in ("timer", "ankle_hybrid"):
                     result = run_timer_exercise(
+                        cap=cap,
+                        pose=pose,
+                        renderer=renderer,
+                        speaker=speaker,
+                        exercise=exercise,
+                        exercise_index=index,
+                        total_exercises=len(exercises),
+                        side=args.side,
+                        mirror=not args.no_mirror,
+                        reaction_seconds=reaction_seconds,
+                    )
+                elif exercise.mode == "flexion_visual" and exercise.id == "bed_knee_flexion":
+                    result = run_bed_knee_flexion_exercise(
                         cap=cap,
                         pose=pose,
                         renderer=renderer,
