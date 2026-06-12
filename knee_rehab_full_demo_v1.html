@@ -356,6 +356,7 @@
     let trainingWebrtcStartedAt = null;
     let trainingWebrtcFallbackTimer = null;
     let trainingWebrtcIntentionalStop = true;
+    const viewStateKey = 'rehabLocalViewState';
 
     function iconSvg(id) {
       const common = 'class="rehab-icon" viewBox="0 0 64 64" aria-hidden="true"';
@@ -627,6 +628,14 @@
     async function refreshAfterTrainingFinished(finalStatus) {
       await syncRemoteState(false);
       if (finalStatus?.completed && session?.role === 'patient') {
+        if (currentDayDetail?.date) {
+          showDayDetail(currentDayDetail.date, currentDayDetail.role || 'patient', currentDayDetail.source || 'calendar');
+          return;
+        }
+        if (lastPatientView === 'calendar') {
+          showPatientView('calendar');
+          return;
+        }
         const source = currentActionDetail?.source || 'plan';
         showPatientView(source === 'library' || source === 'search' ? 'actions' : 'dashboard');
         return;
@@ -663,6 +672,7 @@
     }
 
     startBrowserLifecycle();
+    restoreSessionFromToken();
 
     function hexToRgb(hex) {
       const h = hex.replace('#', '');
@@ -698,6 +708,34 @@
     function getPlan(patient, date = TODAY) { return patient.prescriptions?.[date] || null; }
     function goalLine(goal) { return goal ? `${actions[goal.id].type === 'quantity' ? '数量评价' : '质量评价'}：${goal.label}` : ''; }
     function isPrescribed(patient, date, actionId) { const plan = getPlan(patient, date); return !!plan?.actions.some(g => g.id === actionId); }
+
+    function readViewState() {
+      try {
+        return JSON.parse(localStorage.getItem(viewStateKey) || 'null');
+      } catch (err) {
+        return null;
+      }
+    }
+    function saveViewState(state) {
+      try {
+        localStorage.setItem(viewStateKey, JSON.stringify({ ...state, selectedPatientId }));
+      } catch (err) {}
+    }
+    function clearViewState() {
+      localStorage.removeItem(viewStateKey);
+    }
+    async function restoreSessionFromToken() {
+      if (!apiToken) return;
+      try {
+        const user = await apiRequest('/api/me');
+        apiAvailable = true;
+        await setSession(user, { restore: true });
+      } catch (err) {
+        apiToken = '';
+        localStorage.removeItem('rehabLocalToken');
+        clearViewState();
+      }
+    }
 
     function switchAuthMode(mode) {
       authMode = mode;
@@ -754,14 +792,24 @@
       if (authMode !== 'login') switchAuthMode('login');
       await submitAuth();
     }
-    async function setSession(user) {
+    async function setSession(user, options = {}) {
       session = user;
       if (user.role === 'patient') selectedPatientId = user.patientId;
       document.getElementById('loginScreen').style.display = 'none';
       document.getElementById('app').style.display = 'grid';
       await syncRemoteState(false);
       renderShell();
-      if (user.role === 'patient') showPatientView('dashboard'); else showTherapistView('patients');
+      const saved = options.restore ? readViewState() : null;
+      if (saved?.selectedPatientId && patients[saved.selectedPatientId]) selectedPatientId = saved.selectedPatientId;
+      if (saved?.role === user.role && saved.type === 'day' && saved.date) {
+        showDayDetail(saved.date, saved.role, saved.source || 'calendar');
+      } else if (saved?.role === user.role && saved.type === 'action' && saved.actionId) {
+        openActionDetail(saved.actionId, saved.source || 'library');
+      } else if (user.role === 'patient') {
+        showPatientView(saved?.role === 'patient' && saved.view ? saved.view : 'dashboard');
+      } else {
+        showTherapistView(saved?.role === 'therapist' && saved.view ? saved.view : 'patients');
+      }
     }
     function logout() {
       session = null;
@@ -769,6 +817,7 @@
       document.getElementById('loginScreen').style.display = 'grid';
       apiToken = '';
       localStorage.removeItem('rehabLocalToken');
+      clearViewState();
       document.getElementById('usernameInput').value = 'liming';
       document.getElementById('passwordInput').value = '123456';
       showToast('已退出登录');
@@ -797,11 +846,12 @@
     }
     function setActive(view) { document.querySelectorAll('.nav-item').forEach(btn => btn.classList.toggle('active', btn.dataset.view === view)); }
     function showPatientView(view) {
-      if (activeTraining) sendTrainingCommand('q');
+      if (activeTraining && !activeTraining.receivingStopped) sendTrainingCommand('q');
       disposeCameraStreams();
       currentActionDetail = null;
       currentDayDetail = null;
       lastPatientView = view;
+      saveViewState({ role: 'patient', type: 'view', view });
       setActive(view);
       const content = document.getElementById('content');
       if (view === 'dashboard') content.innerHTML = renderPatientDashboard();
@@ -811,11 +861,12 @@
       bindSearch();
     }
     function showTherapistView(view) {
-      if (activeTraining) sendTrainingCommand('q');
+      if (activeTraining && !activeTraining.receivingStopped) sendTrainingCommand('q');
       disposeCameraStreams();
       currentActionDetail = null;
       currentDayDetail = null;
       lastTherapistView = view;
+      saveViewState({ role: 'therapist', type: 'view', view });
       setActive(view);
       const content = document.getElementById('content');
       if (view === 'patients') content.innerHTML = renderTherapistPatients();
@@ -927,6 +978,7 @@
     function showDayDetail(date, role = session.role, source = 'calendar') {
       currentActionDetail = null;
       currentDayDetail = { date, role, source };
+      saveViewState({ role, type: 'day', date, source });
       const patient = role === 'therapist' ? patients[selectedPatientId] : getPatient();
       document.getElementById('content').innerHTML = renderDayDetail(patient, date, role, source);
       setActive(dayDetailBackView(role, source));
@@ -953,6 +1005,7 @@
     function openActionDetail(actionId, source = 'library') {
       closeSearch();
       currentActionDetail = { actionId, source };
+      saveViewState({ role: session.role, type: 'action', actionId, source });
       document.getElementById('content').innerHTML = renderActionDetail(actionId, source);
       setActive(session.role === 'patient' ? 'actions' : 'stats');
       bindSearch();
@@ -992,6 +1045,7 @@
     }
     function fallbackToMjpeg(reason) {
       if (!activeTraining || activeTraining.streamType !== 'webrtc' || activeTraining.webrtcFallbackUsed) return;
+      if (activeTraining.receivingStopped) return;
       activeTraining.webrtcFallbackUsed = true;
       showToast(reason || 'WebRTC 连接失败，切换到 MJPEG 备用流');
       stopTrainingWebRTC({ intentional: true });
@@ -1113,7 +1167,7 @@
       return `JPEG ${size} KB · 丢帧 ${dropped} · 编码 ${encode} ms · 写入 ${write} ms`;
     }
     function renderCameraBox(actionId) {
-      const isActive = activeTraining && (activeTraining.actionId === actionId || activeTraining.mode === 'one_click');
+      const isActive = activeTraining && !activeTraining.receivingStopped && (activeTraining.actionId === actionId || activeTraining.mode === 'one_click');
       const streamType = activeTraining?.streamType || 'webrtc';
       const stream = isActive && streamType === 'mjpeg_fallback' ? `${activeTraining.streamUrl}?t=${activeTraining.startedAt}` : '';
       const status = latestTrainingStatus || {};
@@ -1251,7 +1305,8 @@
           controlUrl: data.controlUrl,
           pid: data.pid,
           startedAt: Date.now(),
-          webrtcFallbackUsed: false
+          webrtcFallbackUsed: false,
+          receivingStopped: false
         };
         latestTrainingStatus = null;
         startTrainingStatusPolling();
@@ -1286,14 +1341,15 @@
             disposeCameraStreams();
             activeTraining = null;
             await refreshAfterTrainingFinished(finalStatus);
-            showToast(finalStatus.completed ? '训练结果已更新' : '动作识别已结束，未写入新的训练结果');
+            const wroteResult = finalStatus.completed && Number(finalStatus.imported || 0) > 0;
+            showToast(wroteResult ? '训练结果已更新' : '动作识别已结束，未写入新的训练结果');
           } else {
             const statusEl = document.getElementById('recognitionStatus');
             if (statusEl) {
               const status = latestTrainingStatus || {};
               statusEl.innerHTML = `${trainingStatusText(status)}<br>${trainingMetricsText(status)}<br>${status.message || ''}`;
             }
-            if (activeTraining?.streamType === 'webrtc') {
+            if (activeTraining?.streamType === 'webrtc' && !activeTraining.receivingStopped) {
               attachTrainingRemoteStream();
               const state = latestTrainingStatus.webrtcConnectionState;
               if (state === 'failed' || state === 'closed') {
@@ -1313,13 +1369,13 @@
         if (document.exitFullscreen) await document.exitFullscreen().catch(() => {});
         else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
       }
-      activeTraining = null;
-      latestTrainingStatus = null;
+      if (activeTraining) activeTraining.receivingStopped = true;
+      latestTrainingStatus = { ...(latestTrainingStatus || {}), message: '画面已停止，正在保存训练结果...' };
       demoVideoPlaying = false;
-      clearTrainingStatusTimer();
       if (actionId) {
         refreshCameraBox(actionId);
       }
+      showToast('已停止实时画面，正在保存训练结果');
     }
     async function sendTrainingCommand(command) {
       if (!apiAvailable || !activeTraining) return;

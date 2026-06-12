@@ -1716,8 +1716,12 @@ def normalize_real_result_metrics(action_id: str, result: dict[str, Any], config
     if action_mode == "endurance_raise":
         target_angle = float((config_action.get("goal") or {}).get("target_angle_deg") or ACTION_LIBRARY[action_id].get("target_angle_deg", 12))
         hold = float(metrics.get("最长连续达标保持_s") or metrics.get("达标保持总时长_s") or 0)
-        angle = float(metrics.get("最大抬腿角度_deg") or target_angle)
-        completed = int(result.get("completed_units") or metrics.get("完成回合数") or 1)
+        angle = float(metrics.get("最大抬腿角度_deg") or 0)
+        completed = int(result.get("completed_units") or metrics.get("完成回合数") or 0)
+        if completed <= 0 and hold <= 0 and angle <= 0:
+            return {"reps": []}
+        if angle <= 0:
+            angle = target_angle
         reps = [
             {
                 "hold_s": round(hold, 2),
@@ -1747,6 +1751,24 @@ def normalize_real_result_metrics(action_id: str, result: dict[str, Any], config
     return {}
 
 
+def has_meaningful_training_metrics(action_id: str, metrics: dict[str, Any]) -> bool:
+    action_mode = ACTION_LIBRARY[action_id]["mode"]
+    if action_mode == "quantity":
+        return float(metrics.get("completed_count") or 0) > 0
+    if action_mode == "endurance_raise":
+        reps = metrics.get("reps") or []
+        return any(float(rep.get("hold_s") or 0) > 0 or float(rep.get("max_angle_deg") or 0) > 0 for rep in reps)
+    if action_mode == "flexion":
+        return float(metrics.get("max_flexion_deg") or 0) > 0
+    if action_mode == "bed_flexion":
+        return (
+            float(metrics.get("max_flexion_deg") or 0) > 0
+            or float(metrics.get("max_thigh_raise_deg") or 0) > 0
+            or float(metrics.get("hold_s") or 0) > 0
+        )
+    return bool(metrics)
+
+
 def import_real_training_results(session_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
     result_path = session_dir / "result" / "summary.json"
     if not result_path.exists():
@@ -1754,6 +1776,7 @@ def import_real_training_results(session_dir: Path, config: dict[str, Any]) -> d
     payload = json_loads(result_path.read_text(encoding="utf-8"), {})
     config_by_id = {item["id"]: item for item in config.get("actions", [])}
     imported = 0
+    skipped = 0
     with connect() as conn:
         for result in payload.get("results", []):
             action_id = result.get("exercise_id")
@@ -1762,6 +1785,10 @@ def import_real_training_results(session_dir: Path, config: dict[str, Any]) -> d
                 continue
             metrics = normalize_real_result_metrics(action_id, result, config_action)
             if not metrics:
+                skipped += 1
+                continue
+            if not has_meaningful_training_metrics(action_id, metrics):
+                skipped += 1
                 continue
             metrics["desktop_summary"] = result.get("metrics") or {}
             metrics["started_at"] = payload.get("created_at") or dt_now_iso()
@@ -1776,7 +1803,13 @@ def import_real_training_results(session_dir: Path, config: dict[str, Any]) -> d
             )
             imported += 1
         recalculate_daily_score(conn, config["patient_id"], config["date"])
-    return {"imported": imported, "message": f"已导入 {imported} 条真实训练记录。"}
+    if imported:
+        message = f"已导入 {imported} 条真实训练记录。"
+        if skipped:
+            message += f" 跳过 {skipped} 条无有效完成数据的结果。"
+    else:
+        message = "未检测到有效完成数据，未写入新的训练记录。"
+    return {"imported": imported, "skipped": skipped, "message": message}
 
 
 def run_mock_training(patient_id: str, day: str, action_id: str | None, mock_all: bool) -> dict[str, Any]:
