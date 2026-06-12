@@ -30,6 +30,7 @@ import warnings
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -37,6 +38,20 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from aiohttp import web as aiohttp_web
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+    import av
+
+    WEBRTC_AVAILABLE = True
+except Exception:
+    aiohttp_web = None
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    VideoStreamTrack = object  # type: ignore[assignment]
+    av = None
+    WEBRTC_AVAILABLE = False
 
 from rehab_actions.knee_desktop_library import (
     DEFAULT_TARGET_UNITS,
@@ -66,6 +81,15 @@ WEB_PUBLISHER: "WebFramePublisher | None" = None
 WEB_STATUS_LAST_WRITE_TIME = 0.0
 WEB_STATUS_MIN_INTERVAL = 0.3
 WEB_STATUS_LOCK = threading.Lock()
+WEB_FALLBACK_SUBMIT_TIME = 0.0
+WEBRTC_ENABLED = False
+WEBRTC_HOST = "127.0.0.1"
+WEBRTC_PORT: int | None = None
+WEBRTC_WIDTH = 960
+WEBRTC_FPS = 30.0
+WEBRTC_CODEC = "vp8"
+WEBRTC_FRAME_HUB: "WebRTCFrameHub | None" = None
+WEBRTC_SERVER: "WebRTCServer | None" = None
 SESSION_CONFIG: dict[str, object] | None = None
 SESSION_ACTION_CONFIGS: dict[str, dict[str, object]] = {}
 OUTPUT_DIR_OVERRIDE: Path | None = None
@@ -187,6 +211,7 @@ def request_stop(_signum=None, _frame=None) -> None:
     STOP_REQUESTED = True
     if ACTIVE_SPEAKER is not None:
         ACTIVE_SPEAKER.stop()
+    stop_webrtc_server()
 
 
 def stop_requested() -> bool:
@@ -1049,7 +1074,7 @@ def setup_web_stream(
 ) -> None:
     global WEB_STREAM_DIR, WEB_LATEST_FRAME_PATH, WEB_COMMAND_PATH, WEB_PAUSE_PATH, WEB_STATUS_PATH
     global WEB_STREAM_FPS, WEB_STREAM_WIDTH, WEB_JPEG_QUALITY, WEB_FRAME_SEQ, WEB_LAST_FRAME_TIME, WEB_FPS_SMOOTH
-    global WEB_STATUS_LAST_WRITE_TIME, WEB_PUBLISHER
+    global WEB_STATUS_LAST_WRITE_TIME, WEB_PUBLISHER, WEB_FALLBACK_SUBMIT_TIME
     close_web_publisher()
     WEB_STREAM_FPS = max(1.0, float(fps))
     WEB_STREAM_WIDTH = max(320, int(width))
@@ -1058,6 +1083,7 @@ def setup_web_stream(
     WEB_LAST_FRAME_TIME = 0.0
     WEB_FPS_SMOOTH = 0.0
     WEB_STATUS_LAST_WRITE_TIME = 0.0
+    WEB_FALLBACK_SUBMIT_TIME = 0.0
     WEB_STATUS_CONTEXT.update(
         {
             "stream_profile": stream_profile,
@@ -1154,6 +1180,284 @@ def update_web_status(*, force: bool = False, **kwargs: object) -> None:
 def set_web_status_context(**kwargs: object) -> None:
     WEB_STATUS_CONTEXT.update(kwargs)
     update_web_status()
+
+
+class WebRTCFrameHub:
+    """Thread-safe latest-frame holder for the WebRTC video track."""
+
+    def __init__(self, *, width: int = 960) -> None:
+        self.width = max(320, int(width))
+        self.lock = threading.Lock()
+        self.latest_frame: np.ndarray | None = None
+        self.frame_seq = 0
+        self.last_frame_at = 0.0
+        self.processed_fps = 0.0
+
+    def submit(self, frame: np.ndarray) -> None:
+        try:
+            if frame.shape[1] > self.width:
+                scale = self.width / frame.shape[1]
+                frame = cv2.resize(frame, (self.width, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+            copied = frame.copy()
+        except Exception:
+            return
+        now = time.monotonic()
+        with self.lock:
+            if self.last_frame_at:
+                instant_fps = 1.0 / max(now - self.last_frame_at, 1e-6)
+                self.processed_fps = instant_fps if self.processed_fps <= 0 else self.processed_fps * 0.85 + instant_fps * 0.15
+            self.latest_frame = copied
+            self.frame_seq += 1
+            self.last_frame_at = now
+            frame_seq = self.frame_seq
+            processed_fps = self.processed_fps
+        update_web_status(
+            streamType="webrtc",
+            frame_seq=frame_seq,
+            frameSeq=frame_seq,
+            last_frame_at=datetime.now().isoformat(timespec="milliseconds"),
+            latestFrameAgeSeconds=0,
+            processedFps=round(processed_fps, 1),
+            webrtcWidth=self.width,
+            webrtcFpsTarget=WEBRTC_FPS,
+        )
+
+    def get_latest(self) -> tuple[np.ndarray | None, int, float]:
+        with self.lock:
+            frame = None if self.latest_frame is None else self.latest_frame.copy()
+            seq = self.frame_seq
+            age = time.monotonic() - self.last_frame_at if self.last_frame_at else float("inf")
+        return frame, seq, age
+
+
+class ProcessedVideoTrack(VideoStreamTrack):  # type: ignore[misc, valid-type]
+    kind = "video"
+
+    def __init__(self, frame_hub: WebRTCFrameHub, *, fps: float = 30.0, width: int = 960) -> None:
+        super().__init__()
+        self.frame_hub = frame_hub
+        self.fps = max(1.0, float(fps))
+        self.width = max(320, int(width))
+        self.frame_interval = 1.0 / self.fps
+        self.started_at = time.monotonic()
+        self.last_sent_at = 0.0
+        self.sent_frames = 0
+        self.track_fps = 0.0
+        self.last_frame: np.ndarray | None = None
+
+    async def recv(self):  # type: ignore[override]
+        if av is None:
+            raise RuntimeError("当前环境未安装 av，WebRTC 视频不可用。")
+        delay = self.frame_interval - (time.monotonic() - self.last_sent_at)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        frame, seq, age = self.frame_hub.get_latest()
+        if frame is None:
+            frame = self.last_frame
+        if frame is None:
+            frame = np.zeros((540, self.width, 3), dtype=np.uint8)
+            cv2.putText(frame, "Waiting for training frame", (36, 270), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 220), 2)
+        self.last_frame = frame
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+        self.sent_frames += 1
+        now = time.monotonic()
+        if self.last_sent_at:
+            instant_fps = 1.0 / max(now - self.last_sent_at, 1e-6)
+            self.track_fps = instant_fps if self.track_fps <= 0 else self.track_fps * 0.85 + instant_fps * 0.15
+        self.last_sent_at = now
+        video_frame.pts = int((now - self.started_at) * 90000)
+        video_frame.time_base = Fraction(1, 90000)
+        update_web_status(
+            streamType="webrtc",
+            frame_seq=seq,
+            frameSeq=seq,
+            latestFrameAgeSeconds=round(age, 3) if math.isfinite(age) else None,
+            webrtcTrackFps=round(self.track_fps, 1),
+        )
+        return video_frame
+
+
+class WebRTCServer:
+    def __init__(self, *, host: str, port: int, frame_hub: WebRTCFrameHub, width: int, fps: float, codec: str) -> None:
+        self.host = host
+        self.port = int(port)
+        self.frame_hub = frame_hub
+        self.width = int(width)
+        self.fps = float(fps)
+        self.codec = codec
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.runner = None
+        self.pcs: set[object] = set()
+        self.ready = threading.Event()
+        self.failed: Exception | None = None
+        self.thread = threading.Thread(target=self._thread_main, name="webrtc-signaling-server", daemon=True)
+
+    def start(self) -> bool:
+        self.thread.start()
+        return self.ready.wait(timeout=5.0) and self.failed is None
+
+    def close(self) -> None:
+        if self.loop is not None:
+            future = asyncio.run_coroutine_threadsafe(self._shutdown(), self.loop)
+            try:
+                future.result(timeout=2.0)
+            except Exception:
+                pass
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=2.0)
+
+    def _thread_main(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._start())
+            self.ready.set()
+            self.loop.run_forever()
+        except Exception as exc:
+            self.failed = exc
+            self.ready.set()
+        finally:
+            try:
+                self.loop.run_until_complete(self._shutdown())
+            except Exception:
+                pass
+            self.loop.close()
+
+    async def _start(self) -> None:
+        if aiohttp_web is None or RTCPeerConnection is None or RTCSessionDescription is None:
+            raise RuntimeError("当前环境未安装 aiortc/aiohttp，WebRTC 实时画面不可用。")
+        app = aiohttp_web.Application()
+        app.router.add_post("/offer", self._offer)
+        app.router.add_get("/health", self._health)
+        app.router.add_post("/close", self._close)
+        self.runner = aiohttp_web.AppRunner(app)
+        await self.runner.setup()
+        site = aiohttp_web.TCPSite(self.runner, self.host, self.port)
+        await site.start()
+        update_web_status(
+            force=True,
+            streamType="webrtc",
+            webrtcReady=True,
+            webrtcHost=self.host,
+            webrtcPort=self.port,
+            webrtcWidth=self.width,
+            webrtcFpsTarget=self.fps,
+            webrtcCodec=self.codec,
+            webrtcClients=0,
+            message="WebRTC 实时画面服务已就绪。",
+        )
+
+    async def _offer(self, request):
+        params = await request.json()
+        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])  # type: ignore[operator]
+        pc = RTCPeerConnection()  # type: ignore[operator]
+        self.pcs.add(pc)
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            update_web_status(webrtcClients=len(self.pcs), webrtcConnectionState=pc.connectionState)
+            if pc.connectionState in {"failed", "closed", "disconnected"}:
+                await pc.close()
+                self.pcs.discard(pc)
+                update_web_status(webrtcClients=len(self.pcs), webrtcConnectionState=pc.connectionState)
+
+        track = ProcessedVideoTrack(self.frame_hub, fps=self.fps, width=self.width)
+        sender = pc.addTrack(track)
+        if self.codec:
+            try:
+                capabilities = sender.getCapabilities("video")
+                preferred = [c for c in capabilities.codecs if c.mimeType.lower() == f"video/{self.codec}".lower()]
+                if preferred:
+                    sender.setCodecPreferences(preferred)
+            except Exception:
+                pass
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        update_web_status(webrtcClients=len(self.pcs), webrtcConnectionState=pc.connectionState)
+        return aiohttp_web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+
+    async def _health(self, _request):
+        frame, seq, age = self.frame_hub.get_latest()
+        return aiohttp_web.json_response(
+            {
+                "ok": True,
+                "webrtcReady": True,
+                "webrtcClients": len(self.pcs),
+                "frameSeq": seq,
+                "latestFrameAgeSeconds": round(age, 3) if math.isfinite(age) else None,
+                "hasFrame": frame is not None,
+            }
+        )
+
+    async def _close(self, _request):
+        await self._shutdown()
+        if self.loop is not None:
+            self.loop.call_soon(self.loop.stop)
+        return aiohttp_web.json_response({"ok": True})
+
+    async def _shutdown(self) -> None:
+        pcs = list(self.pcs)
+        self.pcs.clear()
+        for pc in pcs:
+            try:
+                await pc.close()
+            except Exception:
+                pass
+        if self.runner is not None:
+            try:
+                await self.runner.cleanup()
+            except Exception:
+                pass
+            self.runner = None
+        update_web_status(webrtcReady=False, webrtcClients=0)
+
+
+def setup_webrtc_stream(
+    *,
+    host: str,
+    port: int | None,
+    width: int = 960,
+    fps: float = 30.0,
+    codec: str = "vp8",
+    disabled: bool = False,
+) -> None:
+    global WEBRTC_ENABLED, WEBRTC_HOST, WEBRTC_PORT, WEBRTC_WIDTH, WEBRTC_FPS, WEBRTC_CODEC, WEBRTC_FRAME_HUB, WEBRTC_SERVER
+    stop_webrtc_server()
+    WEBRTC_ENABLED = False
+    WEBRTC_HOST = host
+    WEBRTC_PORT = port
+    WEBRTC_WIDTH = max(320, int(width))
+    WEBRTC_FPS = max(1.0, float(fps))
+    WEBRTC_CODEC = codec
+    if disabled or not port:
+        return
+    if not WEBRTC_AVAILABLE:
+        message = "当前环境未安装 aiortc，WebRTC 实时画面不可用，请运行 pip install -r requirements.txt。"
+        print(f"⚠️ {message}")
+        update_web_status(force=True, streamType="mjpeg_fallback", webrtcReady=False, webrtcError=message, message=message)
+        return
+    WEBRTC_FRAME_HUB = WebRTCFrameHub(width=WEBRTC_WIDTH)
+    server = WebRTCServer(host=host, port=port, frame_hub=WEBRTC_FRAME_HUB, width=WEBRTC_WIDTH, fps=WEBRTC_FPS, codec=WEBRTC_CODEC)
+    if not server.start():
+        message = f"WebRTC 服务启动失败：{server.failed}"
+        print(f"⚠️ {message}")
+        update_web_status(force=True, streamType="mjpeg_fallback", webrtcReady=False, webrtcError=message, message=message)
+        WEBRTC_FRAME_HUB = None
+        return
+    WEBRTC_SERVER = server
+    WEBRTC_ENABLED = True
+    print(f"WebRTC 实时画面服务已启动：http://{host}:{port}/offer，width={WEBRTC_WIDTH}, fps={WEBRTC_FPS:g}, codec={codec}")
+
+
+def stop_webrtc_server() -> None:
+    global WEBRTC_ENABLED, WEBRTC_FRAME_HUB, WEBRTC_SERVER
+    if WEBRTC_SERVER is not None:
+        WEBRTC_SERVER.close()
+        WEBRTC_SERVER = None
+    WEBRTC_FRAME_HUB = None
+    WEBRTC_ENABLED = False
 
 
 class WebFramePublisher:
@@ -1316,14 +1620,24 @@ def write_web_frame_sync(frame: np.ndarray) -> None:
 
 
 def publish_training_frame(frame: np.ndarray) -> None:
-    if not web_stream_enabled():
+    global WEB_FALLBACK_SUBMIT_TIME
+    webrtc_active = WEBRTC_ENABLED and WEBRTC_FRAME_HUB is not None
+    if not web_stream_enabled() and not webrtc_active:
         cv2.imshow(WINDOW_NAME, frame)
         return
+    if webrtc_active and WEBRTC_FRAME_HUB is not None:
+        WEBRTC_FRAME_HUB.submit(frame)
     if WEB_LATEST_FRAME_PATH is None:
         return
     if web_pause_requested():
         update_web_status(paused=True, message="已暂停")
         return
+    if webrtc_active:
+        now = time.monotonic()
+        min_interval = 1.0 / max(WEB_STREAM_FPS, 1.0)
+        if WEB_FALLBACK_SUBMIT_TIME and now - WEB_FALLBACK_SUBMIT_TIME < min_interval:
+            return
+        WEB_FALLBACK_SUBMIT_TIME = now
     if WEB_PUBLISHER is not None:
         WEB_PUBLISHER.submit(frame)
     else:
@@ -5249,6 +5563,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--web-stream-fps", type=float, default=15.0, help="网页端实时画面推流 FPS，默认 15")
     parser.add_argument("--web-stream-width", type=int, default=800, help="网页端实时画面宽度，默认 800")
     parser.add_argument("--web-jpeg-quality", type=int, default=68, help="网页端 JPEG 质量，默认 68")
+    parser.add_argument("--webrtc-host", default="127.0.0.1", help="WebRTC signaling 监听地址，默认 127.0.0.1")
+    parser.add_argument("--webrtc-port", type=int, default=None, help="WebRTC signaling 监听端口")
+    parser.add_argument("--webrtc-width", type=int, default=960, help="WebRTC 视频宽度，默认 960")
+    parser.add_argument("--webrtc-fps", type=float, default=30.0, help="WebRTC 目标 FPS，默认 30")
+    parser.add_argument("--webrtc-codec", default="vp8", help="WebRTC 首选编码，默认 vp8")
+    parser.add_argument("--disable-webrtc", action="store_true", help="禁用 WebRTC，使用 MJPEG fallback")
     parser.add_argument("--camera-width", type=int, default=None, help="可选摄像头采集宽度，不传则保持默认")
     parser.add_argument("--camera-height", type=int, default=None, help="可选摄像头采集高度，不传则保持默认")
     parser.add_argument("--camera-fps", type=float, default=None, help="可选摄像头采集 FPS，不传则保持默认")
@@ -5268,6 +5588,14 @@ def main() -> None:
         width=args.web_stream_width,
         jpeg_quality=args.web_jpeg_quality,
         stream_profile=args.web_stream_profile,
+    )
+    setup_webrtc_stream(
+        host=args.webrtc_host,
+        port=args.webrtc_port,
+        width=args.webrtc_width,
+        fps=args.webrtc_fps,
+        codec=args.webrtc_codec,
+        disabled=args.disable_webrtc,
     )
     global OUTPUT_DIR_OVERRIDE
     OUTPUT_DIR_OVERRIDE = Path(args.output_dir) if args.output_dir else None
@@ -5381,7 +5709,7 @@ def main() -> None:
             print("3. 分别尝试 --camera 0、--camera 1、--camera 2。")
             print("4. 运行 --list-cameras 查看平台提示，运行 --probe-cameras 探测 OpenCV 序号。")
             return
-        if not web_stream_enabled():
+        if not web_stream_enabled() and not WEBRTC_ENABLED:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
@@ -5468,11 +5796,12 @@ def main() -> None:
 
     finally:
         close_web_publisher()
+        stop_webrtc_server()
         speaker.close()
         ACTIVE_SPEAKER = None
         if cap is not None:
             cap.release()
-        if not web_stream_enabled():
+        if not web_stream_enabled() and not WEBRTC_ENABLED:
             cv2.destroyAllWindows()
 
 

@@ -26,6 +26,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import webbrowser
 from dataclasses import dataclass
@@ -50,6 +52,10 @@ STREAM_PROFILES: dict[str, dict[str, float | int]] = {
     "quality": {"fps": 12.0, "width": 960, "jpeg_quality": 72, "flask_poll_sleep": 0.04},
 }
 DEFAULT_STREAM_PROFILE = "balanced"
+DEFAULT_WEBRTC_WIDTH = 960
+DEFAULT_WEBRTC_FPS = 30
+DEFAULT_WEBRTC_CODEC = "vp8"
+DEFAULT_STREAM_TYPE = "webrtc"
 
 DEMO_START_DATE = date(2026, 6, 1)
 DEMO_END_DATE = date(2026, 6, 28)
@@ -1566,9 +1572,16 @@ def stream_profile_settings(profile: str | None) -> dict[str, float | int]:
     return STREAM_PROFILES[normalize_stream_profile(profile)]
 
 
+def find_free_port(host: str = "127.0.0.1") -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
 def default_training_status(session_id: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = normalize_stream_profile((config or {}).get("stream_profile"))
     settings = stream_profile_settings(profile)
+    stream_type = (config or {}).get("stream_type") or DEFAULT_STREAM_TYPE
     return {
         "session_id": session_id,
         "created_at": dt_now_iso(),
@@ -1586,6 +1599,12 @@ def default_training_status(session_id: str, config: dict[str, Any] | None = Non
         "stream_profile": profile,
         "web_stream_width": settings["width"],
         "web_jpeg_quality": settings["jpeg_quality"],
+        "streamType": stream_type,
+        "webrtcReady": False,
+        "webrtcPort": (config or {}).get("webrtc_port"),
+        "webrtcClients": 0,
+        "webrtcWidth": (config or {}).get("webrtc_width") or DEFAULT_WEBRTC_WIDTH,
+        "webrtcFpsTarget": (config or {}).get("webrtc_fps") or DEFAULT_WEBRTC_FPS,
         "paused": False,
         "stale": True,
         "exited": False,
@@ -1620,14 +1639,30 @@ def read_status_file(session_id: str) -> dict[str, Any]:
     status.setdefault("jpeg_size_kb", None)
     status.setdefault("dropped_frames", 0)
     status.setdefault("publisher_queue_lag_ms", None)
+    status.setdefault("streamType", DEFAULT_STREAM_TYPE)
+    status.setdefault("webrtcReady", False)
+    status.setdefault("webrtcClients", 0)
+    status.setdefault("webrtcWidth", DEFAULT_WEBRTC_WIDTH)
+    status.setdefault("webrtcFpsTarget", DEFAULT_WEBRTC_FPS)
     latest = session_dir / "latest.jpg"
     now = time.time()
-    try:
-        latest_mtime = latest.stat().st_mtime if latest.exists() else None
-    except OSError:
-        latest_mtime = None
-    status["latestFrameAgeSeconds"] = round(now - latest_mtime, 2) if latest_mtime else None
-    status["stale"] = bool(status.get("paused")) is False and (latest_mtime is None or now - latest_mtime > 2.0)
+    if status.get("streamType") == "webrtc":
+        last_frame_at = status.get("last_frame_at")
+        age = None
+        if last_frame_at:
+            try:
+                age = max(0.0, (datetime.now() - datetime.fromisoformat(str(last_frame_at))).total_seconds())
+            except ValueError:
+                age = status.get("latestFrameAgeSeconds")
+        status["latestFrameAgeSeconds"] = round(float(age), 2) if age is not None else None
+        status["stale"] = bool(status.get("paused")) is False and (age is None or float(age) > 2.0)
+    else:
+        try:
+            latest_mtime = latest.stat().st_mtime if latest.exists() else None
+        except OSError:
+            latest_mtime = None
+        status["latestFrameAgeSeconds"] = round(now - latest_mtime, 2) if latest_mtime else None
+        status["stale"] = bool(status.get("paused")) is False and (latest_mtime is None or now - latest_mtime > 2.0)
     stderr_path = session_dir / "stderr.log"
     if stderr_path.exists():
         tail = stderr_path.read_text(encoding="utf-8", errors="ignore")[-2000:]
@@ -1730,6 +1765,33 @@ def run_mock_training(patient_id: str, day: str, action_id: str | None, mock_all
     return {"inserted": inserted, "dailyScore": daily, "detail": patient_daily_detail(patient_id, day)}
 
 
+def http_json_request(url: str, payload: dict[str, Any] | None = None, timeout: float = 5.0) -> dict[str, Any]:
+    data = None if payload is None else json_dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"} if payload is not None else {},
+        method="POST" if payload is not None else "GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json_loads(resp.read().decode("utf-8"), {})
+
+
+def wait_for_webrtc_health(port: int, timeout_seconds: float = 3.0) -> tuple[bool, dict[str, Any] | None, str | None]:
+    deadline = time.monotonic() + timeout_seconds
+    last_error: str | None = None
+    url = f"http://127.0.0.1:{port}/health"
+    while time.monotonic() < deadline:
+        try:
+            data = http_json_request(url, timeout=0.5)
+            if data.get("ok"):
+                return True, data, None
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.1)
+    return False, None, last_error or "WebRTC health check timed out"
+
+
 def launch_real_training(
     patient_id: str,
     day: str,
@@ -1737,6 +1799,7 @@ def launch_real_training(
     run_all_pending: bool,
     session_id: str,
     stream_profile: str = DEFAULT_STREAM_PROFILE,
+    stream_type: str = DEFAULT_STREAM_TYPE,
 ) -> dict[str, Any]:
     script = ROOT / "knee_rehab_desktop_session.py"
     if not script.exists():
@@ -1754,14 +1817,21 @@ def launch_real_training(
             mode=mode,
             action_id=action_id,
         )
-    stream_profile = normalize_stream_profile(stream_profile)
+    requested_stream_type = stream_type if stream_type in {"webrtc", "mjpeg_fallback"} else DEFAULT_STREAM_TYPE
+    stream_profile = "quality"
     stream_settings = stream_profile_settings(stream_profile)
+    webrtc_port = find_free_port() if requested_stream_type == "webrtc" else None
     config["stream_profile"] = stream_profile
     config["stream_settings"] = {
         "fps": stream_settings["fps"],
         "width": stream_settings["width"],
         "jpegQuality": stream_settings["jpeg_quality"],
     }
+    config["stream_type"] = requested_stream_type
+    config["webrtc_port"] = webrtc_port
+    config["webrtc_width"] = DEFAULT_WEBRTC_WIDTH
+    config["webrtc_fps"] = DEFAULT_WEBRTC_FPS
+    config["webrtc_codec"] = DEFAULT_WEBRTC_CODEC
     if not config["actions"]:
         return {
             "mode": "already_completed",
@@ -1796,12 +1866,40 @@ def launch_real_training(
         "--web-stream-profile",
         stream_profile,
     ]
-    if stream_profile == "smooth":
-        cmd.extend(["--camera-width", "960", "--camera-height", "540", "--camera-fps", "30"])
+    if requested_stream_type == "webrtc" and webrtc_port is not None:
+        cmd.extend(
+            [
+                "--webrtc-host",
+                "127.0.0.1",
+                "--webrtc-port",
+                str(webrtc_port),
+                "--webrtc-width",
+                str(DEFAULT_WEBRTC_WIDTH),
+                "--webrtc-fps",
+                str(DEFAULT_WEBRTC_FPS),
+                "--webrtc-codec",
+                DEFAULT_WEBRTC_CODEC,
+            ]
+        )
+    else:
+        cmd.append("--disable-webrtc")
     stdout_file = (session_dir / "stdout.log").open("w", encoding="utf-8")
     stderr_file = (session_dir / "stderr.log").open("w", encoding="utf-8")
     process = subprocess.Popen(cmd, cwd=ROOT, stdout=stdout_file, stderr=stderr_file, text=True)
     start_training_watcher(process, session_dir, config, stdout_file, stderr_file)
+    stream_type_result = "mjpeg_fallback"
+    webrtc_health: dict[str, Any] | None = None
+    webrtc_error: str | None = None
+    if requested_stream_type == "webrtc" and webrtc_port is not None:
+        ok, webrtc_health, webrtc_error = wait_for_webrtc_health(webrtc_port)
+        stream_type_result = "webrtc" if ok else "mjpeg_fallback"
+        if not ok:
+            status = read_status_file(session_id)
+            status["streamType"] = "mjpeg_fallback"
+            status["webrtcReady"] = False
+            status["webrtcError"] = webrtc_error or "WebRTC signaling server 未就绪"
+            status["message"] = "WebRTC 实时画面不可用，已切换到 MJPEG 备用流。"
+            write_status_file(session_dir, status)
     exercise_ids = [item["id"] for item in config["actions"]]
     return {
         "mode": "real_process",
@@ -1812,14 +1910,20 @@ def launch_real_training(
         "date": day,
         "exerciseIds": exercise_ids,
         "streamUrl": f"/api/training-stream/{session_id}",
+        "fallbackStreamUrl": f"/api/training-stream/{session_id}",
         "statusUrl": f"/api/training/status/{session_id}",
         "controlUrl": f"/api/training/control/{session_id}",
-        "streamProfile": stream_profile,
-        "streamSettings": {
-            "fps": stream_settings["fps"],
-            "width": stream_settings["width"],
-            "jpegQuality": stream_settings["jpeg_quality"],
+        "streamType": stream_type_result,
+        "webrtcOfferUrl": f"/api/training/webrtc-offer/{session_id}" if webrtc_port is not None else None,
+        "webrtc": {
+            "width": DEFAULT_WEBRTC_WIDTH,
+            "fps": DEFAULT_WEBRTC_FPS,
+            "codec": DEFAULT_WEBRTC_CODEC,
+            "port": webrtc_port,
+            "ready": stream_type_result == "webrtc",
+            "health": webrtc_health,
         },
+        "webrtcError": webrtc_error if stream_type_result != "webrtc" else None,
         "note": "已启动网页内嵌动作识别进程。",
     }
 
@@ -2132,6 +2236,22 @@ def make_app(mock_training: bool = False):
         except Exception as exc:
             return api_error(str(exc), 404)
 
+    @app.post("/api/training/webrtc-offer/<session_id>")
+    def training_webrtc_offer(session_id: str):
+        payload = request.get_json(force=True, silent=True) or {}
+        try:
+            status = read_status_file(session_id)
+            port = status.get("webrtcPort") or status.get("webrtc_port")
+            if not port:
+                return api_error("该训练 session 没有可用的 WebRTC signaling 端口。", 404)
+            target_url = f"http://127.0.0.1:{int(port)}/offer"
+            answer = http_json_request(target_url, payload, timeout=6.0)
+            return jsonify({"ok": True, **answer})
+        except urllib.error.URLError as exc:
+            return api_error(f"WebRTC signaling 转发失败：{exc}", 502)
+        except Exception as exc:
+            return api_error(str(exc), 500)
+
     @app.post("/api/training/control/<session_id>")
     def training_control_session(session_id: str):
         payload = request.get_json(force=True, silent=True) or {}
@@ -2158,13 +2278,14 @@ def make_app(mock_training: bool = False):
         mock_all = payload.get("mode") in {"today", "one_click", "all"}
         use_mock = bool(payload.get("mock", mock_training))
         stream_profile = normalize_stream_profile(payload.get("stream_profile") or payload.get("streamProfile"))
+        stream_type = payload.get("stream_type") or payload.get("streamType") or DEFAULT_STREAM_TYPE
         if not use_mock:
             active = active_training_status()
             if active:
                 return api_error("已有训练正在进行，请先退出当前训练或等待完成。", 409)
             try:
                 session_id = uuid.uuid4().hex
-                result = launch_real_training(patient_id, day, action_id, mock_all, session_id, stream_profile)
+                result = launch_real_training(patient_id, day, action_id, mock_all, session_id, stream_profile, stream_type)
                 if result.get("mode") == "real_process":
                     runtime_state["active_session_id"] = session_id
             except Exception as exc:
