@@ -2,6 +2,7 @@
 """Local API/data layer for the knee rehabilitation demo.
 
 Run:
+  python knee_rehab_local_app.py
   python knee_rehab_local_app.py --init-demo
   python knee_rehab_local_app.py --serve
 """
@@ -18,9 +19,13 @@ import os
 import random
 import secrets
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import uuid
 import webbrowser
 from dataclasses import dataclass
@@ -37,9 +42,20 @@ DB_PATH = DATA_DIR / "rehab_local.sqlite3"
 KEY_PATH = DATA_DIR / "secret.key"
 SEED_PATH = DATA_DIR / "demo_seed.json"
 EXPORT_DIR = DATA_DIR / "exported_sessions"
+RUNTIME_DIR = DATA_DIR / "runtime"
+
+STREAM_PROFILES: dict[str, dict[str, float | int]] = {
+    "smooth": {"fps": 18.0, "width": 720, "jpeg_quality": 62, "flask_poll_sleep": 0.02},
+    "balanced": {"fps": 15.0, "width": 800, "jpeg_quality": 68, "flask_poll_sleep": 0.025},
+    "quality": {"fps": 12.0, "width": 960, "jpeg_quality": 72, "flask_poll_sleep": 0.04},
+}
+DEFAULT_STREAM_PROFILE = "balanced"
 
 DEMO_START_DATE = date(2026, 6, 1)
-DEMO_TODAY = date(2026, 6, 15)
+DEMO_END_DATE = date(2026, 6, 28)
+SIMULATED_RECORD_END_DATE = date(2026, 6, 14)
+_SYSTEM_TODAY = date.today()
+DEMO_TODAY = _SYSTEM_TODAY if DEMO_START_DATE <= _SYSTEM_TODAY <= DEMO_END_DATE else date(2026, 6, 11)
 PASSWORD_ITERATIONS = 200_000
 
 ACTION_ORDER = [
@@ -297,6 +313,7 @@ def dt_now_iso() -> str:
 def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     EXPORT_DIR.mkdir(exist_ok=True)
+    RUNTIME_DIR.mkdir(exist_ok=True)
 
 
 def connect() -> sqlite3.Connection:
@@ -598,7 +615,7 @@ def upsert_prescription(conn: sqlite3.Connection, patient_id: str, day: str, tem
 
 def seed_prescriptions(conn: sqlite3.Connection) -> None:
     for patient in DEMO_PATIENTS:
-        for day in date_range(DEMO_START_DATE, date(2026, 6, 28)):
+        for day in date_range(DEMO_START_DATE, DEMO_END_DATE):
             upsert_prescription(
                 conn,
                 patient["id"],
@@ -867,6 +884,11 @@ def action_score_from_sessions(action_id: str, goal: dict[str, Any], sessions: l
         if stability_values:
             metrics["stability_score"] = sum(stability_values) / len(stability_values)
         return score_action(action_id, goal, metrics)
+    if action["mode"] == "endurance_raise":
+        reps: list[dict[str, Any]] = []
+        for session in sessions:
+            reps.extend(session["metrics"].get("reps") or [])
+        return score_action(action_id, goal, {"reps": reps})
     scored = [score_action(action_id, goal, s["metrics"]) for s in sessions]
     return max(scored, key=lambda x: x.score)
 
@@ -946,7 +968,7 @@ def recalculate_daily_score(conn: sqlite3.Connection, patient_id: str, day: str)
 
 def desired_score_for(patient: dict[str, Any], day: date, rng: random.Random) -> float:
     low, high = patient["score_range"]
-    span_days = max(1, (date(2026, 6, 14) - DEMO_START_DATE).days)
+    span_days = max(1, (SIMULATED_RECORD_END_DATE - DEMO_START_DATE).days)
     progress = (day - DEMO_START_DATE).days / span_days
     trend = low + (high - low) * progress
     return clamp(trend + rng.uniform(-8, 8), low - 4, high + 4)
@@ -995,7 +1017,7 @@ def mock_metrics_for(action_id: str, goal: dict[str, Any] | None, target_score: 
 def seed_training_records(conn: sqlite3.Connection) -> None:
     for patient in DEMO_PATIENTS:
         rng = random.Random(patient["seed"])
-        for day in date_range(DEMO_START_DATE, date(2026, 6, 14)):
+        for day in date_range(DEMO_START_DATE, SIMULATED_RECORD_END_DATE):
             day_key = day.isoformat()
             plan = get_prescription(conn, patient["id"], day_key)
             if not plan:
@@ -1247,7 +1269,7 @@ def register_user(username: str, password: str, role: str) -> dict[str, Any]:
                     now,
                 ),
             )
-            for day in date_range(DEMO_TODAY, date(2026, 6, 28)):
+            for day in date_range(DEMO_TODAY, DEMO_END_DATE):
                 upsert_prescription(conn, patient_id, day.isoformat(), "week2_straight_raise", prescription_actions_for_date(day))
         else:
             therapist_id = f"t{secrets.randbelow(900) + 100}"
@@ -1323,14 +1345,367 @@ def unfinished_actions(conn: sqlite3.Connection, patient_id: str, day: str) -> l
     plan = get_prescription(conn, patient_id, day)
     if not plan:
         return []
-    daily = recalculate_daily_score(conn, patient_id, day)
-    by_id = {item["id"]: item for item in daily.get("prescribed_scores", [])}
     pending = []
     for goal in plan["actions"]:
-        score = by_id.get(goal["id"], {}).get("score", 0)
-        if score < 95:
+        progress = compute_action_progress(conn, patient_id, day, goal["id"], goal)
+        if not progress.get("completed"):
             pending.append(goal)
     return pending
+
+
+def compute_action_progress(
+    conn: sqlite3.Connection,
+    patient_id: str,
+    day: str,
+    action_id: str,
+    goal: dict[str, Any] | None,
+) -> dict[str, Any]:
+    action = ACTION_LIBRARY[action_id]
+    sessions = sessions_for_day(conn, patient_id, day, prescribed_only=True)
+    action_sessions = [s for s in sessions if s["action_id"] == action_id]
+    mode = action["mode"]
+    if mode == "quantity":
+        target = int(goal.get("target_count") if goal else action.get("default_target_count", 1))
+        completed = int(round(sum(float(s["metrics"].get("completed_count") or 0) for s in action_sessions)))
+        return {
+            "score_type": "quantity",
+            "completed_count": completed,
+            "target_count": target,
+            "remaining_count": max(target - completed, 0),
+            "completed": completed >= target,
+            "allow_over_target": True,
+        }
+    if mode == "endurance_raise":
+        target_reps = int((goal or {}).get("target_reps") or action.get("target_reps", 5))
+        valid_reps = 0
+        best_scores: list[float] = []
+        best_angle = 0.0
+        best_hold = 0.0
+        for session in action_sessions:
+            scored = score_action(action_id, goal, session["metrics"])
+            details = scored.details
+            valid_reps += int(details.get("valid_reps") or 0)
+            best_angle = max(best_angle, float(details.get("best_angle_deg") or 0))
+            best_hold = max(best_hold, float(details.get("best_hold_s") or 0))
+            for rep in details.get("reps") or []:
+                best_scores.append(float(rep.get("score") or 0))
+        best_scores = sorted(best_scores, reverse=True)[:target_reps]
+        return {
+            "score_type": "endurance_raise",
+            "valid_reps": valid_reps,
+            "target_reps": target_reps,
+            "remaining_reps": max(target_reps - valid_reps, 0),
+            "best_five_scores": best_scores,
+            "best_angle_deg": round(best_angle, 1),
+            "best_hold_s": round(best_hold, 1),
+            "completed": valid_reps >= target_reps,
+        }
+    if mode == "flexion":
+        target = float((goal or {}).get("target_flexion_deg") or action.get("target_flexion_deg", 120))
+        best = 0.0
+        best_hold = 0.0
+        for session in action_sessions:
+            metrics = session["metrics"]
+            best = max(best, float(metrics.get("max_flexion_deg") or 0))
+            best_hold = max(best_hold, float(metrics.get("hold_s") or 0))
+        completed = best >= target * 0.95
+        return {
+            "score_type": "flexion",
+            "target_units": 1,
+            "best_flexion_deg": round(best, 1),
+            "target_flexion_deg": target,
+            "best_hold_s": round(best_hold, 1),
+            "remaining_units": 0 if completed else 1,
+            "completed": completed,
+        }
+    if mode == "bed_flexion":
+        best_flexion = 0.0
+        best_thigh = 0.0
+        best_hold = 0.0
+        for session in action_sessions:
+            metrics = session["metrics"]
+            best_flexion = max(best_flexion, float(metrics.get("max_flexion_deg") or 0))
+            best_thigh = max(best_thigh, float(metrics.get("max_thigh_raise_deg") or 0))
+            best_hold = max(best_hold, float(metrics.get("hold_s") or 0))
+        completed = best_flexion >= 114 and best_hold >= 8
+        return {
+            "score_type": "bed_flexion",
+            "target_units": 1,
+            "best_flexion_deg": round(best_flexion, 1),
+            "best_thigh_raise_deg": round(best_thigh, 1),
+            "best_hold_s": round(best_hold, 1),
+            "remaining_units": 0 if completed else 1,
+            "completed": completed,
+        }
+    return {"score_type": mode, "completed": False}
+
+
+def action_run_target_units(action_id: str, goal: dict[str, Any] | None, progress: dict[str, Any], mode: str) -> int:
+    action_mode = ACTION_LIBRARY[action_id]["mode"]
+    if action_mode == "quantity":
+        remaining = int(progress.get("remaining_count") or 0)
+        target = int((goal or {}).get("target_count") or ACTION_LIBRARY[action_id].get("default_target_count", 1))
+        return max(1, remaining if mode == "one_click" else max(remaining, min(target, 10)))
+    if action_mode == "endurance_raise":
+        remaining = int(progress.get("remaining_reps") or 0)
+        target = int((goal or {}).get("target_reps") or ACTION_LIBRARY[action_id].get("target_reps", 5))
+        return max(1, remaining if mode == "one_click" else target)
+    return 1
+
+
+def build_training_action_config(
+    conn: sqlite3.Connection,
+    patient_id: str,
+    day: str,
+    action_id: str,
+    goal: dict[str, Any] | None,
+    mode: str,
+) -> dict[str, Any]:
+    action = ACTION_LIBRARY[action_id]
+    progress = compute_action_progress(conn, patient_id, day, action_id, goal)
+    source = "prescribed" if goal else "extra"
+    run_target_units = action_run_target_units(action_id, goal, progress, mode)
+    display: dict[str, Any] = {"score_type": progress["score_type"]}
+    if action["mode"] == "quantity":
+        display.update(
+            {
+                "base_completed": int(progress.get("completed_count") or 0),
+                "total_target": int(progress.get("target_count") or (goal or {}).get("target_count") or 1),
+                "allow_over_target": True,
+            }
+        )
+    elif action["mode"] == "endurance_raise":
+        display.update(
+            {
+                "base_valid_reps": int(progress.get("valid_reps") or 0),
+                "target_reps": int(progress.get("target_reps") or (goal or {}).get("target_reps") or 5),
+                "best_angle_deg": progress.get("best_angle_deg"),
+                "best_hold_s": progress.get("best_hold_s"),
+            }
+        )
+    elif action["mode"] == "flexion":
+        display.update(
+            {
+                "best_flexion_deg": progress.get("best_flexion_deg"),
+                "target_flexion_deg": progress.get("target_flexion_deg") or (goal or {}).get("target_flexion_deg") or 120,
+            }
+        )
+    elif action["mode"] == "bed_flexion":
+        display.update(
+            {
+                "best_flexion_deg": progress.get("best_flexion_deg"),
+                "best_thigh_raise_deg": progress.get("best_thigh_raise_deg"),
+                "target_flexion_deg": (goal or {}).get("target_flexion_deg") or 120,
+                "target_thigh_raise_deg": (goal or {}).get("target_thigh_raise_deg") or 60,
+            }
+        )
+    return {
+        "id": action_id,
+        "name": action["name"],
+        "source": source,
+        "score_type": progress["score_type"],
+        "goal": goal or copy.deepcopy(action),
+        "progress": progress,
+        "run_target_units": run_target_units,
+        "display": display,
+    }
+
+
+def build_training_session_config(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    patient_id: str,
+    day: str,
+    mode: str,
+    action_id: str | None,
+) -> dict[str, Any]:
+    plan = get_prescription(conn, patient_id, day)
+    goals = {goal["id"]: goal for goal in (plan or {}).get("actions", [])}
+    action_configs: list[dict[str, Any]] = []
+    if mode == "one_click":
+        for goal in (plan or {}).get("actions", []):
+            progress = compute_action_progress(conn, patient_id, day, goal["id"], goal)
+            if not progress.get("completed"):
+                action_configs.append(
+                    build_training_action_config(conn, patient_id, day, goal["id"], goal, mode)
+                )
+    else:
+        if not action_id:
+            raise ValueError("single mode requires action_id")
+        action_configs.append(
+            build_training_action_config(conn, patient_id, day, action_id, goals.get(action_id), mode)
+        )
+    return {
+        "session_id": session_id,
+        "patient_id": patient_id,
+        "date": day,
+        "mode": mode,
+        "source_policy": "prescribed_or_extra",
+        "created_at": dt_now_iso(),
+        "actions": action_configs,
+    }
+
+
+def stream_session_dir(session_id: str) -> Path:
+    safe_id = "".join(ch for ch in session_id if ch.isalnum() or ch in {"_", "-"})
+    if not safe_id:
+        raise ValueError("invalid session id")
+    path = RUNTIME_DIR / "training_stream" / safe_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def normalize_stream_profile(profile: str | None) -> str:
+    if profile in STREAM_PROFILES:
+        return profile
+    return DEFAULT_STREAM_PROFILE
+
+
+def stream_profile_settings(profile: str | None) -> dict[str, float | int]:
+    return STREAM_PROFILES[normalize_stream_profile(profile)]
+
+
+def default_training_status(session_id: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    profile = normalize_stream_profile((config or {}).get("stream_profile"))
+    settings = stream_profile_settings(profile)
+    return {
+        "session_id": session_id,
+        "created_at": dt_now_iso(),
+        "patient_id": (config or {}).get("patient_id"),
+        "date": (config or {}).get("date"),
+        "mode": (config or {}).get("mode"),
+        "frame_seq": 0,
+        "last_frame_at": None,
+        "fps": 0,
+        "encode_ms": None,
+        "write_ms": None,
+        "jpeg_size_kb": None,
+        "dropped_frames": 0,
+        "publisher_queue_lag_ms": None,
+        "stream_profile": profile,
+        "web_stream_width": settings["width"],
+        "web_jpeg_quality": settings["jpeg_quality"],
+        "paused": False,
+        "stale": True,
+        "exited": False,
+        "completed": False,
+        "failed": False,
+        "returncode": None,
+        "message": "训练进程准备启动。",
+        "error": None,
+        "active_action": None,
+        "logTail": "",
+    }
+
+
+def write_status_file(session_dir: Path, status: dict[str, Any]) -> None:
+    status["updated_at"] = dt_now_iso()
+    tmp = session_dir / "status.tmp"
+    tmp.write_text(json_dumps(status), encoding="utf-8")
+    tmp.replace(session_dir / "status.json")
+
+
+def read_status_file(session_id: str) -> dict[str, Any]:
+    session_dir = stream_session_dir(session_id)
+    status_path = session_dir / "status.json"
+    status = json_loads(status_path.read_text(encoding="utf-8"), {}) if status_path.exists() else default_training_status(session_id)
+    profile = normalize_stream_profile(status.get("stream_profile"))
+    settings = stream_profile_settings(profile)
+    status.setdefault("stream_profile", profile)
+    status.setdefault("web_stream_width", settings["width"])
+    status.setdefault("web_jpeg_quality", settings["jpeg_quality"])
+    status.setdefault("encode_ms", None)
+    status.setdefault("write_ms", None)
+    status.setdefault("jpeg_size_kb", None)
+    status.setdefault("dropped_frames", 0)
+    status.setdefault("publisher_queue_lag_ms", None)
+    latest = session_dir / "latest.jpg"
+    now = time.time()
+    try:
+        latest_mtime = latest.stat().st_mtime if latest.exists() else None
+    except OSError:
+        latest_mtime = None
+    status["latestFrameAgeSeconds"] = round(now - latest_mtime, 2) if latest_mtime else None
+    status["stale"] = bool(status.get("paused")) is False and (latest_mtime is None or now - latest_mtime > 2.0)
+    stderr_path = session_dir / "stderr.log"
+    if stderr_path.exists():
+        tail = stderr_path.read_text(encoding="utf-8", errors="ignore")[-2000:]
+        if tail:
+            status["logTail"] = tail
+    return status
+
+
+def normalize_real_result_metrics(action_id: str, result: dict[str, Any], config_action: dict[str, Any]) -> dict[str, Any]:
+    metrics = result.get("metrics") or {}
+    action_mode = ACTION_LIBRARY[action_id]["mode"]
+    if action_mode == "quantity":
+        completed = metrics.get("完成次数", result.get("completed_units", 0))
+        return {"completed_count": int(round(float(completed or 0)))}
+    if action_mode == "endurance_raise":
+        target_angle = float((config_action.get("goal") or {}).get("target_angle_deg") or ACTION_LIBRARY[action_id].get("target_angle_deg", 12))
+        hold = float(metrics.get("最长连续达标保持_s") or metrics.get("达标保持总时长_s") or 0)
+        angle = float(metrics.get("最大抬腿角度_deg") or target_angle)
+        completed = int(result.get("completed_units") or metrics.get("完成回合数") or 1)
+        reps = [
+            {
+                "hold_s": round(hold, 2),
+                "max_angle_deg": round(angle, 1),
+                "stability_score": 85,
+            }
+            for _ in range(max(1, completed))
+        ]
+        return {"reps": reps}
+    if action_mode == "flexion":
+        return {
+            "max_flexion_deg": float(metrics.get("最大屈膝角度_deg") or 0),
+            "hold_s": float(metrics.get("保持目标时长_s") or (config_action.get("goal") or {}).get("target_hold_s") or 6),
+            "stability_score": 85,
+        }
+    if action_mode == "bed_flexion":
+        records = metrics.get("保持记录") or []
+        best_record = records[-1] if records else {}
+        return {
+            "max_flexion_deg": float(metrics.get("最大屈膝角_deg") or metrics.get("最大屈膝角度_deg") or best_record.get("最大屈膝角_deg") or 0),
+            "max_thigh_raise_deg": float(metrics.get("大腿最大上抬角_deg") or best_record.get("大腿最大上抬角_deg") or 0),
+            "hold_s": float(metrics.get("保持目标时长_s") or 10),
+            "thigh_wave_deg": float(metrics.get("最大保持期大腿角波动_deg") or 0),
+            "flexion_wave_deg": float(metrics.get("最大保持期屈膝角波动_deg") or 0),
+            "stability_score": 90 if int(metrics.get("稳定保持回合数") or 0) > 0 else 75,
+        }
+    return {}
+
+
+def import_real_training_results(session_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    result_path = session_dir / "result" / "summary.json"
+    if not result_path.exists():
+        return {"imported": 0, "message": "未找到 summary.json，未导入 SQLite。"}
+    payload = json_loads(result_path.read_text(encoding="utf-8"), {})
+    config_by_id = {item["id"]: item for item in config.get("actions", [])}
+    imported = 0
+    with connect() as conn:
+        for result in payload.get("results", []):
+            action_id = result.get("exercise_id")
+            config_action = config_by_id.get(action_id)
+            if not action_id or not config_action:
+                continue
+            metrics = normalize_real_result_metrics(action_id, result, config_action)
+            if not metrics:
+                continue
+            metrics["desktop_summary"] = result.get("metrics") or {}
+            metrics["started_at"] = payload.get("created_at") or dt_now_iso()
+            metrics["ended_at"] = dt_now_iso()
+            insert_training_session(
+                conn,
+                config["patient_id"],
+                action_id,
+                config["date"],
+                metrics,
+                config_action.get("source", "prescribed"),
+            )
+            imported += 1
+        recalculate_daily_score(conn, config["patient_id"], config["date"])
+    return {"imported": imported, "message": f"已导入 {imported} 条真实训练记录。"}
 
 
 def run_mock_training(patient_id: str, day: str, action_id: str | None, mock_all: bool) -> dict[str, Any]:
@@ -1355,33 +1730,130 @@ def run_mock_training(patient_id: str, day: str, action_id: str | None, mock_all
     return {"inserted": inserted, "dailyScore": daily, "detail": patient_daily_detail(patient_id, day)}
 
 
-def launch_real_training(patient_id: str, day: str, action_id: str | None, run_all_pending: bool) -> dict[str, Any]:
+def launch_real_training(
+    patient_id: str,
+    day: str,
+    action_id: str | None,
+    run_all_pending: bool,
+    session_id: str,
+    stream_profile: str = DEFAULT_STREAM_PROFILE,
+) -> dict[str, Any]:
     script = ROOT / "knee_rehab_desktop_session.py"
     if not script.exists():
         raise FileNotFoundError("knee_rehab_desktop_session.py 不存在")
-    exercise_ids: list[str] = []
+    mode = "one_click" if run_all_pending or not action_id else "single"
+    session_dir = stream_session_dir(session_id)
+    result_dir = session_dir / "result"
+    result_dir.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
-        if run_all_pending or not action_id:
-            exercise_ids = [goal["id"] for goal in unfinished_actions(conn, patient_id, day)]
-            if not exercise_ids:
-                plan = get_prescription(conn, patient_id, day)
-                exercise_ids = [goal["id"] for goal in plan["actions"]] if plan else []
-        else:
-            exercise_ids = [action_id]
-    cmd = [sys.executable, str(script), "--plan", "full"]
-    for exercise_id in exercise_ids:
-        cmd.extend(["--exercise", exercise_id])
-    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
-    process = subprocess.Popen(cmd, cwd=ROOT, creationflags=creationflags)
+        config = build_training_session_config(
+            conn,
+            session_id=session_id,
+            patient_id=patient_id,
+            day=day,
+            mode=mode,
+            action_id=action_id,
+        )
+    stream_profile = normalize_stream_profile(stream_profile)
+    stream_settings = stream_profile_settings(stream_profile)
+    config["stream_profile"] = stream_profile
+    config["stream_settings"] = {
+        "fps": stream_settings["fps"],
+        "width": stream_settings["width"],
+        "jpegQuality": stream_settings["jpeg_quality"],
+    }
+    if not config["actions"]:
+        return {
+            "mode": "already_completed",
+            "sessionId": session_id,
+            "patientId": patient_id,
+            "date": day,
+            "exerciseIds": [],
+            "message": "今日处方已完成。",
+        }
+    config_path = session_dir / "session_config.json"
+    config_path.write_text(json_dumps(config), encoding="utf-8")
+    write_status_file(session_dir, default_training_status(session_id, config))
+    for stale_name in ("latest.jpg", "command.txt", "pause.flag"):
+        stale = session_dir / stale_name
+        if stale.exists():
+            stale.unlink()
+    cmd = [
+        sys.executable,
+        str(script),
+        "--session-config",
+        str(config_path),
+        "--web-stream-dir",
+        str(session_dir),
+        "--output-dir",
+        str(result_dir),
+        "--web-stream-fps",
+        str(stream_settings["fps"]),
+        "--web-stream-width",
+        str(stream_settings["width"]),
+        "--web-jpeg-quality",
+        str(stream_settings["jpeg_quality"]),
+        "--web-stream-profile",
+        stream_profile,
+    ]
+    if stream_profile == "smooth":
+        cmd.extend(["--camera-width", "960", "--camera-height", "540", "--camera-fps", "30"])
+    stdout_file = (session_dir / "stdout.log").open("w", encoding="utf-8")
+    stderr_file = (session_dir / "stderr.log").open("w", encoding="utf-8")
+    process = subprocess.Popen(cmd, cwd=ROOT, stdout=stdout_file, stderr=stderr_file, text=True)
+    start_training_watcher(process, session_dir, config, stdout_file, stderr_file)
+    exercise_ids = [item["id"] for item in config["actions"]]
     return {
         "mode": "real_process",
+        "sessionId": session_id,
         "pid": process.pid,
         "command": cmd,
         "patientId": patient_id,
         "date": day,
         "exerciseIds": exercise_ids,
-        "note": "已启动桌面识别进程；真实识别结果暂由桌面脚本保存，网页 SQLite 记录请使用 mock=true 或后续接入导入流程。",
+        "streamUrl": f"/api/training-stream/{session_id}",
+        "statusUrl": f"/api/training/status/{session_id}",
+        "controlUrl": f"/api/training/control/{session_id}",
+        "streamProfile": stream_profile,
+        "streamSettings": {
+            "fps": stream_settings["fps"],
+            "width": stream_settings["width"],
+            "jpegQuality": stream_settings["jpeg_quality"],
+        },
+        "note": "已启动网页内嵌动作识别进程。",
     }
+
+
+def start_training_watcher(
+    process: subprocess.Popen,
+    session_dir: Path,
+    config: dict[str, Any],
+    stdout_file,
+    stderr_file,
+) -> None:
+    def watch() -> None:
+        returncode = process.wait()
+        stdout_file.close()
+        stderr_file.close()
+        status = read_status_file(config["session_id"])
+        status["exited"] = True
+        status["returncode"] = returncode
+        try:
+            import_result = import_real_training_results(session_dir, config)
+            status["completed"] = returncode == 0
+            status["failed"] = returncode != 0
+            status["message"] = import_result["message"] if returncode == 0 else "训练进程异常退出。"
+            status["imported"] = import_result.get("imported", 0)
+            if returncode != 0:
+                status["error"] = status.get("logTail") or "训练进程异常退出。"
+        except Exception as exc:
+            status["completed"] = False
+            status["failed"] = True
+            status["error"] = str(exc)
+            status["message"] = "训练结果导入失败。"
+        write_status_file(session_dir, status)
+
+    threading.Thread(target=watch, daemon=True).start()
 
 
 def patient_summary(patient_id: str) -> dict[str, Any]:
@@ -1417,7 +1889,7 @@ SESSIONS: dict[str, dict[str, Any]] = {}
 
 def make_app(mock_training: bool = False):
     try:
-        from flask import Flask, jsonify, redirect, request, send_from_directory
+        from flask import Flask, Response, jsonify, redirect, request, send_from_directory
     except ModuleNotFoundError as exc:
         raise SystemExit("缺少 Flask，请先运行 pip install -r requirements.txt") from exc
 
@@ -1426,6 +1898,15 @@ def make_app(mock_training: bool = False):
         seed_demo(reseed=False)
 
     app = Flask(__name__)
+    runtime_state: dict[str, Any] = {
+        "shutdown_requested": False,
+        "shutdown_reason": None,
+        "shutdown_requested_at": None,
+        "close_deadline": None,
+        "last_heartbeat": None,
+        "active_session_id": None,
+    }
+    app.config["RUNTIME_STATE"] = runtime_state
 
     def api_ok(data: Any = None, **kwargs):
         payload = {"ok": True}
@@ -1442,9 +1923,76 @@ def make_app(mock_training: bool = False):
         token = token or request.headers.get("X-Session-Token", "").strip()
         return SESSIONS.get(token)
 
+    def mark_browser_active() -> None:
+        runtime_state["last_heartbeat"] = time.monotonic()
+        if not runtime_state["shutdown_requested"]:
+            runtime_state["close_deadline"] = None
+
+    def request_server_shutdown(reason: str, delay_seconds: float = 2.0) -> None:
+        runtime_state["shutdown_requested"] = True
+        runtime_state["shutdown_reason"] = reason
+        runtime_state["shutdown_requested_at"] = runtime_state["shutdown_requested_at"] or time.monotonic()
+        runtime_state["close_deadline"] = time.monotonic() + delay_seconds
+
+    def active_training_status() -> dict[str, Any] | None:
+        session_id = runtime_state.get("active_session_id")
+        if not session_id:
+            return None
+        try:
+            status = read_status_file(session_id)
+        except Exception:
+            return None
+        if status.get("exited") or status.get("completed") or status.get("failed"):
+            runtime_state["active_session_id"] = None
+            return None
+        return status
+
+    def write_training_command(session_id: str, command: str) -> None:
+        stream_dir = stream_session_dir(session_id)
+        if command == "pause":
+            (stream_dir / "pause.flag").write_text("pause", encoding="utf-8")
+            return
+        if command == "resume":
+            pause_flag = stream_dir / "pause.flag"
+            if pause_flag.exists():
+                pause_flag.unlink()
+            return
+        if command not in {"q", "n", "r"}:
+            raise ValueError("unsupported training command")
+        pause_flag = stream_dir / "pause.flag"
+        if pause_flag.exists():
+            pause_flag.unlink()
+        (stream_dir / "command.txt").write_text(command, encoding="utf-8")
+
     @app.get("/")
     def index():
         return redirect("/knee_rehab_full_demo_v1.html")
+
+    @app.post("/api/browser-opened")
+    def browser_opened():
+        mark_browser_active()
+        return api_ok({"status": "active"})
+
+    @app.post("/api/browser-heartbeat")
+    def browser_heartbeat():
+        mark_browser_active()
+        return api_ok({"status": "active"})
+
+    @app.post("/api/browser-closed")
+    def browser_closed():
+        runtime_state["close_deadline"] = time.monotonic() + 2.0
+        return api_ok({"status": "closing"})
+
+    @app.get("/api/runtime-status")
+    def runtime_status():
+        active = active_training_status()
+        return api_ok(
+            {
+                "shutdownRequested": runtime_state["shutdown_requested"],
+                "shutdownReason": runtime_state["shutdown_reason"],
+                "activeTraining": active,
+            }
+        )
 
     @app.get("/api/app-state")
     def app_state():
@@ -1526,6 +2074,81 @@ def make_app(mock_training: bool = False):
         day = request.args.get("date") or DEMO_TODAY.isoformat()
         return api_ok(patient_daily_detail(patient_id, day))
 
+    def stream_response_for_session(session_id: str, poll_sleep: float | None = None):
+        stream_dir = stream_session_dir(session_id)
+        latest = stream_dir / "latest.jpg"
+        status_path = stream_dir / "status.json"
+        profile = DEFAULT_STREAM_PROFILE
+        if status_path.exists():
+            try:
+                profile = normalize_stream_profile(json_loads(status_path.read_text(encoding="utf-8"), {}).get("stream_profile"))
+            except OSError:
+                profile = DEFAULT_STREAM_PROFILE
+        sleep_seconds = float(poll_sleep if poll_sleep is not None else stream_profile_settings(profile)["flask_poll_sleep"])
+
+        def generate():
+            last_mtime = None
+            while not runtime_state["shutdown_requested"]:
+                try:
+                    if latest.exists():
+                        mtime = latest.stat().st_mtime_ns
+                        if mtime != last_mtime:
+                            last_mtime = mtime
+                            frame = latest.read_bytes()
+                            yield (
+                                b"--frame\r\n"
+                                b"Content-Type: image/jpeg\r\n"
+                                b"Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                                b"Pragma: no-cache\r\n"
+                                b"X-Accel-Buffering: no\r\n\r\n"
+                                + frame
+                                + b"\r\n"
+                            )
+                except OSError:
+                    pass
+                time.sleep(sleep_seconds)
+
+        response = Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
+
+    @app.get("/api/training-stream/<session_id>")
+    def training_stream_session(session_id: str):
+        return stream_response_for_session(session_id)
+
+    @app.get("/api/training-stream/current")
+    def training_stream_current():
+        session_id = runtime_state.get("active_session_id")
+        if not session_id:
+            return api_error("当前没有正在运行的训练。", 404)
+        return stream_response_for_session(session_id)
+
+    @app.get("/api/training/status/<session_id>")
+    def training_status(session_id: str):
+        try:
+            return api_ok(read_status_file(session_id))
+        except Exception as exc:
+            return api_error(str(exc), 404)
+
+    @app.post("/api/training/control/<session_id>")
+    def training_control_session(session_id: str):
+        payload = request.get_json(force=True, silent=True) or {}
+        command = payload.get("command")
+        try:
+            write_training_command(session_id, command)
+        except ValueError as exc:
+            return api_error(str(exc))
+        return api_ok({"sessionId": session_id, "command": command})
+
+    @app.post("/api/training/control")
+    def training_control():
+        session_id = runtime_state.get("active_session_id")
+        if not session_id:
+            return api_error("当前没有正在运行的训练。", 404)
+        return training_control_session(session_id)
+
     @app.post("/api/training/start")
     def training_start():
         payload = request.get_json(force=True, silent=True) or {}
@@ -1534,9 +2157,16 @@ def make_app(mock_training: bool = False):
         action_id = payload.get("action_id") or payload.get("actionId")
         mock_all = payload.get("mode") in {"today", "one_click", "all"}
         use_mock = bool(payload.get("mock", mock_training))
+        stream_profile = normalize_stream_profile(payload.get("stream_profile") or payload.get("streamProfile"))
         if not use_mock:
+            active = active_training_status()
+            if active:
+                return api_error("已有训练正在进行，请先退出当前训练或等待完成。", 409)
             try:
-                result = launch_real_training(patient_id, day, action_id, mock_all)
+                session_id = uuid.uuid4().hex
+                result = launch_real_training(patient_id, day, action_id, mock_all, session_id, stream_profile)
+                if result.get("mode") == "real_process":
+                    runtime_state["active_session_id"] = session_id
             except Exception as exc:
                 return api_error(str(exc))
             return api_ok(result)
@@ -1601,21 +2231,103 @@ def print_summary() -> None:
     print("Demo 账号: therapist / 123456, liming / 123456, zhangmin / 123456, chenhao / 123456")
 
 
+def print_active_training() -> None:
+    stream_root = RUNTIME_DIR / "training_stream"
+    if not stream_root.exists():
+        print("当前没有训练 session。")
+        return
+    sessions = sorted((p for p in stream_root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not sessions:
+        print("当前没有训练 session。")
+        return
+    for session_dir in sessions[:5]:
+        status_path = session_dir / "status.json"
+        status = json_loads(status_path.read_text(encoding="utf-8"), {}) if status_path.exists() else {}
+        print(f"- {session_dir.name}: exited={status.get('exited')} completed={status.get('completed')} failed={status.get('failed')} fps={status.get('fps')} stale={status.get('stale')}")
+        print(f"  path: {session_dir}")
+        print(f"  message: {status.get('message')}")
+
+
+def port_is_available(host: str, port: int) -> bool:
+    bind_host = "127.0.0.1" if host in {"localhost", "0.0.0.0"} else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        try:
+            sock.bind((bind_host, port))
+        except OSError:
+            return False
+    return True
+
+
+def choose_available_port(host: str, preferred_port: int) -> int:
+    for port in range(preferred_port, preferred_port + 20):
+        if port_is_available(host, port):
+            return port
+    return preferred_port
+
+
+def run_local_server(app: Any, *, host: str, port: int, url: str, open_browser: bool) -> None:
+    try:
+        from werkzeug.serving import make_server
+    except ModuleNotFoundError as exc:
+        raise SystemExit("缺少 Werkzeug，请先运行 pip install -r requirements.txt") from exc
+
+    runtime_state: dict[str, Any] = app.config["RUNTIME_STATE"]
+    server = make_server(host, port, app, threaded=True)
+    server.timeout = 0.5
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def request_shutdown_from_signal(signum, _frame) -> None:
+        runtime_state["shutdown_requested"] = True
+        runtime_state["shutdown_reason"] = "ctrl_c" if signum == signal.SIGINT else "signal"
+        runtime_state["shutdown_requested_at"] = time.monotonic()
+        runtime_state["close_deadline"] = time.monotonic() + 2.0
+        print("收到退出信号，正在通知网页关闭...")
+
+    signal.signal(signal.SIGINT, request_shutdown_from_signal)
+    signal.signal(signal.SIGTERM, request_shutdown_from_signal)
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        while True:
+            server.handle_request()
+            now = time.monotonic()
+            close_deadline = runtime_state.get("close_deadline")
+            if close_deadline and now >= close_deadline:
+                break
+            if runtime_state.get("shutdown_requested"):
+                requested_at = runtime_state.get("shutdown_requested_at") or now
+                if now - requested_at >= 2.0:
+                    break
+    finally:
+        server.server_close()
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local knee rehabilitation demo API")
     parser.add_argument("--init-demo", action="store_true", help="initialize demo data if it is missing")
     parser.add_argument("--reseed-demo", action="store_true", help="recreate demo data")
     parser.add_argument("--reset-key", action="store_true", help="also recreate the Fernet key when reseeding")
     parser.add_argument("--print-summary", action="store_true", help="print local demo data summary")
+    parser.add_argument("--print-active-training", action="store_true", help="print recent real training session status")
     parser.add_argument("--serve", action="store_true", help="serve the local API and frontend")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-browser", action="store_true", help="serve without opening the browser automatically")
     parser.add_argument("--mock-training", action="store_true", help="force API training calls to use mock data")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    raw_args = argv if argv is not None else sys.argv[1:]
+    args = parse_args(raw_args)
+    no_command = not any([args.init_demo, args.reseed_demo, args.print_summary, args.print_active_training, args.serve])
+    if no_command:
+        args.serve = True
+        print("未传入命令行参数，默认启动本地网页端。")
     if args.reseed_demo:
         if args.reset_key and DATA_DIR.exists() and DB_PATH.exists():
             backup = EXPORT_DIR / f"backup_before_reset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite3"
@@ -1628,16 +2340,24 @@ def main(argv: list[str] | None = None) -> int:
         print("Demo 数据已初始化。")
     if args.print_summary:
         print_summary()
+    if args.print_active_training:
+        print_active_training()
     if args.serve:
         seed_demo(reseed=False, reset_key=False)
         app = make_app(mock_training=args.mock_training)
-        url = f"http://{args.host}:{args.port}/knee_rehab_full_demo_v1.html"
+        port = choose_available_port(args.host, args.port)
+        if port != args.port:
+            print(f"端口 {args.port} 已被占用，自动改用 {port}。")
+        url_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
+        url = f"http://{url_host}:{port}/knee_rehab_full_demo_v1.html"
         print(f"本地服务已启动: {url}")
-        if args.host in {"127.0.0.1", "localhost"}:
-            webbrowser.open(url)
-        app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
-    if not any([args.init_demo, args.reseed_demo, args.print_summary, args.serve]):
-        print("请指定 --init-demo、--reseed-demo、--print-summary 或 --serve。")
+        run_local_server(
+            app,
+            host=args.host,
+            port=port,
+            url=url,
+            open_browser=not args.no_browser and url_host in {"127.0.0.1", "localhost"},
+        )
     return 0
 
 

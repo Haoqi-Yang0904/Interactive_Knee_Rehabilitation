@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Cross-platform desktop knee rehabilitation session.
 
@@ -24,10 +24,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
@@ -49,6 +50,25 @@ from rehab_actions.knee_desktop_library import (
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 WINDOW_NAME = "Knee Rehab Desktop Session"
+WEB_STREAM_DIR: Path | None = None
+WEB_LATEST_FRAME_PATH: Path | None = None
+WEB_COMMAND_PATH: Path | None = None
+WEB_PAUSE_PATH: Path | None = None
+WEB_STATUS_PATH: Path | None = None
+WEB_STREAM_FPS = 15.0
+WEB_STREAM_WIDTH = 800
+WEB_JPEG_QUALITY = 68
+WEB_FRAME_SEQ = 0
+WEB_LAST_FRAME_TIME = 0.0
+WEB_FPS_SMOOTH = 0.0
+WEB_STATUS_CONTEXT: dict[str, object] = {}
+WEB_PUBLISHER: "WebFramePublisher | None" = None
+WEB_STATUS_LAST_WRITE_TIME = 0.0
+WEB_STATUS_MIN_INTERVAL = 0.3
+WEB_STATUS_LOCK = threading.Lock()
+SESSION_CONFIG: dict[str, object] | None = None
+SESSION_ACTION_CONFIGS: dict[str, dict[str, object]] = {}
+OUTPUT_DIR_OVERRIDE: Path | None = None
 MIN_LANDMARK_VISIBILITY = 0.20
 LANDMARK_FRAME_MARGIN = 0.05
 LEG_SWITCH_SCORE_MARGIN = 0.35
@@ -906,6 +926,47 @@ def build_session_exercises(
     return exercises
 
 
+def load_session_config(path: str | None) -> dict[str, object] | None:
+    global SESSION_CONFIG, SESSION_ACTION_CONFIGS
+    if not path:
+        SESSION_CONFIG = None
+        SESSION_ACTION_CONFIGS = {}
+        return None
+    config = json.loads(Path(path).read_text(encoding="utf-8"))
+    SESSION_CONFIG = config
+    SESSION_ACTION_CONFIGS = {
+        str(item["id"]): item for item in config.get("actions", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    return config
+
+
+def build_session_config_exercises(config: dict[str, object]) -> list[Exercise]:
+    action_items = [item for item in config.get("actions", []) if isinstance(item, dict)]
+    if not action_items:
+        return []
+    registry = {exercise.id: exercise for exercise in select_exercises(DEFAULT_TARGET_UNITS)}
+    exercises: list[Exercise] = []
+    for item in action_items:
+        action_id = str(item["id"])
+        base = registry[action_id]
+        run_target_units = max(1, int(item.get("run_target_units") or base.target_units))
+        goal = item.get("goal") if isinstance(item.get("goal"), dict) else {}
+        kwargs: dict[str, object] = {"target_units": run_target_units}
+        if base.mode == "visual":
+            if goal.get("target_angle_deg") is not None:
+                kwargs["target_movement_degrees"] = float(goal["target_angle_deg"])
+            if goal.get("target_hold_s") is not None:
+                kwargs["target_hold_seconds"] = float(goal["target_hold_s"])
+        if base.mode == "flexion_visual":
+            if goal.get("target_flexion_deg") is not None:
+                kwargs["target_flexion_degrees"] = float(goal["target_flexion_deg"])
+            if goal.get("target_hold_s") is not None:
+                kwargs["target_hold_seconds"] = float(goal["target_hold_s"])
+        exercises.append(replace(base, **kwargs))
+    return exercises
+
+
 def parse_exercise_ids(raw_values: list[str] | None) -> list[str] | None:
     if not raw_values:
         return None
@@ -976,6 +1037,297 @@ def backend_name(backend: int) -> str:
     if backend == cv2.CAP_ANY:
         return "CAP_ANY"
     return str(backend)
+
+
+def setup_web_stream(
+    stream_dir: str | None,
+    *,
+    fps: float = 15.0,
+    width: int = 800,
+    jpeg_quality: int = 68,
+    stream_profile: str = "balanced",
+) -> None:
+    global WEB_STREAM_DIR, WEB_LATEST_FRAME_PATH, WEB_COMMAND_PATH, WEB_PAUSE_PATH, WEB_STATUS_PATH
+    global WEB_STREAM_FPS, WEB_STREAM_WIDTH, WEB_JPEG_QUALITY, WEB_FRAME_SEQ, WEB_LAST_FRAME_TIME, WEB_FPS_SMOOTH
+    global WEB_STATUS_LAST_WRITE_TIME, WEB_PUBLISHER
+    close_web_publisher()
+    WEB_STREAM_FPS = max(1.0, float(fps))
+    WEB_STREAM_WIDTH = max(320, int(width))
+    WEB_JPEG_QUALITY = max(35, min(95, int(jpeg_quality)))
+    WEB_FRAME_SEQ = 0
+    WEB_LAST_FRAME_TIME = 0.0
+    WEB_FPS_SMOOTH = 0.0
+    WEB_STATUS_LAST_WRITE_TIME = 0.0
+    WEB_STATUS_CONTEXT.update(
+        {
+            "stream_profile": stream_profile,
+            "web_stream_width": WEB_STREAM_WIDTH,
+            "web_jpeg_quality": WEB_JPEG_QUALITY,
+            "message": "网页流准备启动。",
+        }
+    )
+    if not stream_dir:
+        WEB_STREAM_DIR = None
+        WEB_LATEST_FRAME_PATH = None
+        WEB_COMMAND_PATH = None
+        WEB_PAUSE_PATH = None
+        WEB_STATUS_PATH = None
+        return
+    WEB_STREAM_DIR = Path(stream_dir)
+    WEB_STREAM_DIR.mkdir(parents=True, exist_ok=True)
+    WEB_LATEST_FRAME_PATH = WEB_STREAM_DIR / "latest.jpg"
+    WEB_COMMAND_PATH = WEB_STREAM_DIR / "command.txt"
+    WEB_PAUSE_PATH = WEB_STREAM_DIR / "pause.flag"
+    WEB_STATUS_PATH = WEB_STREAM_DIR / "status.json"
+    for stale in (WEB_LATEST_FRAME_PATH, WEB_COMMAND_PATH, WEB_PAUSE_PATH):
+        if stale is not None and stale.exists():
+            stale.unlink()
+    WEB_PUBLISHER = WebFramePublisher(
+        latest_path=WEB_LATEST_FRAME_PATH,
+        fps=WEB_STREAM_FPS,
+        width=WEB_STREAM_WIDTH,
+        jpeg_quality=WEB_JPEG_QUALITY,
+    )
+    update_web_status(force=True)
+    print(
+        "网页实时画面优化：识别主循环只提交最新帧；JPEG resize/编码/写 latest.jpg "
+        f"由后台线程完成。profile={stream_profile}, fps={WEB_STREAM_FPS:g}, "
+        f"width={WEB_STREAM_WIDTH}, quality={WEB_JPEG_QUALITY}。"
+    )
+    print("瓶颈提示：网页 MJPEG 仍会经过 JPEG 编码、磁盘中转、Flask 读文件和浏览器 JPEG 解码。")
+
+
+def web_stream_enabled() -> bool:
+    return WEB_STREAM_DIR is not None
+
+
+def read_web_command_key() -> int | None:
+    if WEB_COMMAND_PATH is None or not WEB_COMMAND_PATH.exists():
+        return None
+    try:
+        command = WEB_COMMAND_PATH.read_text(encoding="utf-8").strip().lower()
+        WEB_COMMAND_PATH.unlink(missing_ok=True)
+    except OSError:
+        return None
+    if command in {"q", "n", "r"}:
+        return ord(command)
+    return None
+
+
+def web_pause_requested() -> bool:
+    return WEB_PAUSE_PATH is not None and WEB_PAUSE_PATH.exists()
+
+
+def update_web_status(*, force: bool = False, **kwargs: object) -> None:
+    global WEB_STATUS_LAST_WRITE_TIME
+    if WEB_STATUS_PATH is None:
+        return
+    with WEB_STATUS_LOCK:
+        now = time.monotonic()
+        if not force and WEB_STATUS_PATH.exists() and now - WEB_STATUS_LAST_WRITE_TIME < WEB_STATUS_MIN_INTERVAL:
+            return
+        existing: dict[str, object] = {}
+        if WEB_STATUS_PATH.exists():
+            try:
+                existing = json.loads(WEB_STATUS_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        payload = {
+            **existing,
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+            "frame_seq": WEB_FRAME_SEQ,
+            "fps": round(WEB_FPS_SMOOTH, 1),
+            "paused": web_pause_requested(),
+            "stale": False,
+            **WEB_STATUS_CONTEXT,
+            **kwargs,
+        }
+        try:
+            tmp = WEB_STATUS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            tmp.replace(WEB_STATUS_PATH)
+            WEB_STATUS_LAST_WRITE_TIME = now
+        except OSError:
+            pass
+
+
+def set_web_status_context(**kwargs: object) -> None:
+    WEB_STATUS_CONTEXT.update(kwargs)
+    update_web_status()
+
+
+class WebFramePublisher:
+    """Asynchronous latest-frame publisher for the webpage MJPEG bridge.
+
+    The original webpage mode encoded JPEG and wrote latest.jpg inside the
+    recognition loop. That made every camera/MediaPipe iteration wait for
+    resize, cv2.imencode and filesystem replace. This publisher keeps only one
+    latest frame and performs those slow steps on a daemon thread.
+    """
+
+    def __init__(self, *, latest_path: Path, fps: float, width: int, jpeg_quality: int) -> None:
+        self.latest_path = latest_path
+        self.tmp_path = latest_path.with_suffix(".tmp")
+        self.fps = max(1.0, float(fps))
+        self.width = max(320, int(width))
+        self.jpeg_quality = max(35, min(95, int(jpeg_quality)))
+        self._lock = threading.Lock()
+        self._frame_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._latest_frame: np.ndarray | None = None
+        self._latest_submit_time = 0.0
+        self._dropped_frames = 0
+        self._last_publish_time = 0.0
+        self._thread = threading.Thread(target=self._run, name="web-frame-publisher", daemon=True)
+        self._thread.start()
+
+    def submit(self, frame: np.ndarray) -> None:
+        try:
+            copied = frame.copy()
+        except Exception:
+            return
+        with self._lock:
+            if self._latest_frame is not None:
+                self._dropped_frames += 1
+            self._latest_frame = copied
+            self._latest_submit_time = time.monotonic()
+            self._frame_event.set()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._frame_event.set()
+        self._thread.join(timeout=1.0)
+
+    def _take_latest_frame(self) -> tuple[np.ndarray | None, float, int]:
+        with self._lock:
+            frame = self._latest_frame
+            submitted_at = self._latest_submit_time
+            dropped = self._dropped_frames
+            self._latest_frame = None
+            self._frame_event.clear()
+        return frame, submitted_at, dropped
+
+    def _run(self) -> None:
+        global WEB_FRAME_SEQ, WEB_LAST_FRAME_TIME, WEB_FPS_SMOOTH
+        min_interval = 1.0 / max(self.fps, 1.0)
+        while not self._stop_event.is_set():
+            if not self._frame_event.wait(timeout=0.1):
+                continue
+            if self._stop_event.is_set():
+                break
+            remaining = min_interval - (time.monotonic() - self._last_publish_time)
+            if remaining > 0:
+                self._stop_event.wait(timeout=remaining)
+                if self._stop_event.is_set():
+                    break
+            frame, submitted_at, dropped = self._take_latest_frame()
+            if frame is None:
+                continue
+            if web_pause_requested():
+                update_web_status(paused=True, message="已暂停")
+                continue
+            try:
+                if frame.shape[1] > self.width:
+                    scale = self.width / frame.shape[1]
+                    frame = cv2.resize(frame, (self.width, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                encode_start = time.perf_counter()
+                ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+                encode_ms = (time.perf_counter() - encode_start) * 1000
+                if not ok:
+                    update_web_status(message="网页帧 JPEG 编码失败")
+                    continue
+                data = encoded.tobytes()
+                write_start = time.perf_counter()
+                self.tmp_path.write_bytes(data)
+                self.tmp_path.replace(self.latest_path)
+                write_ms = (time.perf_counter() - write_start) * 1000
+                now = time.monotonic()
+                WEB_FRAME_SEQ += 1
+                if WEB_LAST_FRAME_TIME:
+                    instant_fps = 1.0 / max(now - WEB_LAST_FRAME_TIME, 1e-6)
+                    WEB_FPS_SMOOTH = instant_fps if WEB_FPS_SMOOTH <= 0 else WEB_FPS_SMOOTH * 0.8 + instant_fps * 0.2
+                WEB_LAST_FRAME_TIME = now
+                self._last_publish_time = now
+                update_web_status(
+                    force=WEB_FRAME_SEQ <= 1,
+                    frame_seq=WEB_FRAME_SEQ,
+                    last_frame_at=datetime.now().isoformat(timespec="milliseconds"),
+                    fps=round(WEB_FPS_SMOOTH, 1),
+                    encode_ms=round(encode_ms, 1),
+                    write_ms=round(write_ms, 1),
+                    jpeg_size_kb=round(len(data) / 1024, 1),
+                    dropped_frames=dropped,
+                    publisher_queue_lag_ms=round(max(0.0, now - submitted_at) * 1000, 1) if submitted_at else None,
+                    paused=False,
+                    stale=False,
+                )
+            except Exception as exc:
+                update_web_status(message=f"网页帧发布失败：{exc}")
+
+
+def close_web_publisher() -> None:
+    global WEB_PUBLISHER
+    if WEB_PUBLISHER is not None:
+        WEB_PUBLISHER.close()
+        WEB_PUBLISHER = None
+
+
+def write_web_frame_sync(frame: np.ndarray) -> None:
+    """Fallback writer used only if the publisher could not be created."""
+    global WEB_FRAME_SEQ, WEB_LAST_FRAME_TIME, WEB_FPS_SMOOTH
+    if WEB_LATEST_FRAME_PATH is None:
+        return
+    try:
+        if frame.shape[1] > WEB_STREAM_WIDTH:
+            scale = WEB_STREAM_WIDTH / frame.shape[1]
+            frame = cv2.resize(frame, (WEB_STREAM_WIDTH, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+        encode_start = time.perf_counter()
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), WEB_JPEG_QUALITY])
+        encode_ms = (time.perf_counter() - encode_start) * 1000
+        if not ok:
+            return
+        data = encoded.tobytes()
+        write_start = time.perf_counter()
+        tmp_path = WEB_LATEST_FRAME_PATH.with_suffix(".tmp")
+        tmp_path.write_bytes(data)
+        tmp_path.replace(WEB_LATEST_FRAME_PATH)
+        write_ms = (time.perf_counter() - write_start) * 1000
+        now = time.monotonic()
+        WEB_FRAME_SEQ += 1
+        if WEB_LAST_FRAME_TIME:
+            instant_fps = 1.0 / max(now - WEB_LAST_FRAME_TIME, 1e-6)
+            WEB_FPS_SMOOTH = instant_fps if WEB_FPS_SMOOTH <= 0 else WEB_FPS_SMOOTH * 0.8 + instant_fps * 0.2
+        WEB_LAST_FRAME_TIME = now
+        update_web_status(
+            force=WEB_FRAME_SEQ <= 1,
+            frame_seq=WEB_FRAME_SEQ,
+            last_frame_at=datetime.now().isoformat(timespec="milliseconds"),
+            fps=round(WEB_FPS_SMOOTH, 1),
+            encode_ms=round(encode_ms, 1),
+            write_ms=round(write_ms, 1),
+            jpeg_size_kb=round(len(data) / 1024, 1),
+            dropped_frames=0,
+            publisher_queue_lag_ms=0,
+            paused=False,
+            stale=False,
+        )
+    except Exception as exc:
+        update_web_status(message=f"网页帧同步发布失败：{exc}")
+
+
+def publish_training_frame(frame: np.ndarray) -> None:
+    if not web_stream_enabled():
+        cv2.imshow(WINDOW_NAME, frame)
+        return
+    if WEB_LATEST_FRAME_PATH is None:
+        return
+    if web_pause_requested():
+        update_web_status(paused=True, message="已暂停")
+        return
+    if WEB_PUBLISHER is not None:
+        WEB_PUBLISHER.submit(frame)
+    else:
+        write_web_frame_sync(frame)
 
 
 def read_camera_frame(cap: cv2.VideoCapture, *, attempts: int = CAMERA_READ_RETRY_ATTEMPTS) -> np.ndarray | None:
@@ -1052,7 +1404,42 @@ def print_camera_help(*, probe_indices: bool = False) -> None:
         print("OpenCV 没有探测到可打开的摄像头。请检查系统摄像头权限，或关闭正在占用摄像头的应用。")
 
 
-def open_camera(camera_index: int) -> cv2.VideoCapture:
+def configure_camera_capture(
+    cap: cv2.VideoCapture,
+    *,
+    camera_width: int | None = None,
+    camera_height: int | None = None,
+    camera_fps: float | None = None,
+) -> None:
+    settings: list[tuple[int, float, str]] = []
+    if camera_width:
+        settings.append((cv2.CAP_PROP_FRAME_WIDTH, float(camera_width), "width"))
+    else:
+        settings.append((cv2.CAP_PROP_FRAME_WIDTH, 1280.0, "default width"))
+    if camera_height:
+        settings.append((cv2.CAP_PROP_FRAME_HEIGHT, float(camera_height), "height"))
+    else:
+        settings.append((cv2.CAP_PROP_FRAME_HEIGHT, 720.0, "default height"))
+    if camera_fps:
+        settings.append((cv2.CAP_PROP_FPS, float(camera_fps), "fps"))
+    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+        settings.append((cv2.CAP_PROP_BUFFERSIZE, 1.0, "buffer size"))
+    for prop, value, label in settings:
+        try:
+            ok = cap.set(prop, value)
+            if not ok and label not in {"default width", "default height"}:
+                print(f"⚠️ 摄像头参数 {label}={value:g} 可能未被当前后端接受。")
+        except Exception as exc:
+            print(f"⚠️ 摄像头参数 {label}={value:g} 设置失败：{exc}")
+
+
+def open_camera(
+    camera_index: int,
+    *,
+    camera_width: int | None = None,
+    camera_height: int | None = None,
+    camera_fps: float | None = None,
+) -> cv2.VideoCapture:
     backend_candidates = camera_backend_candidates()
     index_candidates = camera_index_candidates(camera_index)
     attempted: list[str] = []
@@ -1069,8 +1456,12 @@ def open_camera(camera_index: int) -> cv2.VideoCapture:
                 cap.release()
                 continue
             if read_camera_frame(cap, attempts=2) is not None:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                configure_camera_capture(
+                    cap,
+                    camera_width=camera_width,
+                    camera_height=camera_height,
+                    camera_fps=camera_fps,
+                )
                 print(f"摄像头已打开：index={index}, backend={backend_name(backend)}")
                 if camera_index < 0 and index == 0 and is_macos():
                     print("提示：如果这里仍然是手机摄像头，请运行 --list-cameras 后用 --camera 指定内置摄像头序号。")
@@ -2439,6 +2830,8 @@ def handle_common_keys(key: int) -> str | None:
 
 
 def window_closed() -> bool:
+    if web_stream_enabled():
+        return False
     try:
         return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1
     except Exception:
@@ -2446,7 +2839,13 @@ def window_closed() -> bool:
 
 
 def poll_training_key(delay_ms: int = 1) -> int:
-    key = cv2.waitKey(delay_ms) & 0xFF
+    if web_stream_enabled():
+        key = read_web_command_key()
+        if key is None:
+            time.sleep(max(delay_ms, 1) / 1000.0)
+            return 255
+    else:
+        key = cv2.waitKey(delay_ms) & 0xFF
     if key == ord("q") or window_closed():
         request_stop()
         return ord("q")
@@ -2482,7 +2881,7 @@ def live_preview_until_voice_done(
             feedback=feedback,
             extra_lines=extra_lines or ["阶段：语音提示", "画面持续刷新中"],
         )
-        cv2.imshow(WINDOW_NAME, frame)
+        publish_training_frame(frame)
         key_action = handle_common_keys(poll_training_key(1))
         if key_action in ("quit", "skip"):
             return key_action
@@ -2916,7 +3315,7 @@ def run_timer_exercise(
                 f"膝角：{knee_angle_text}" if exercise.mode == "timer" else "",
             ],
         )
-        cv2.imshow(WINDOW_NAME, frame)
+        publish_training_frame(frame)
         key = poll_training_key(1)
 
         key_action = handle_common_keys(key)
@@ -3527,7 +3926,7 @@ def run_visual_exercise(
             feedback=feedback,
             extra_lines=extra_lines,
         )
-        cv2.imshow(WINDOW_NAME, frame)
+        publish_training_frame(frame)
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
         if key_action == "quit":
@@ -3973,7 +4372,7 @@ def run_flexion_visual_exercise(
                 "按 r 可重置起始位",
             ],
         )
-        cv2.imshow(WINDOW_NAME, frame)
+        publish_training_frame(frame)
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
         if key_action == "quit":
@@ -4437,7 +4836,7 @@ def run_bed_knee_flexion_exercise(
                 "按 r 可重置起始位",
             ],
         )
-        cv2.imshow(WINDOW_NAME, frame)
+        publish_training_frame(frame)
         key = poll_training_key(1)
         key_action = handle_common_keys(key)
         if key_action == "quit":
@@ -4527,6 +4926,60 @@ def finish_result(
     )
 
 
+def display_progress_line(exercise: Exercise, completed: int) -> tuple[str, dict[str, object]]:
+    config = SESSION_ACTION_CONFIGS.get(exercise.id) if SESSION_ACTION_CONFIGS else None
+    if not config:
+        return f"进度：{completed}/{exercise.target_units}", {
+            "current_completed": completed,
+            "target_units": exercise.target_units,
+        }
+    display = config.get("display") if isinstance(config.get("display"), dict) else {}
+    score_type = display.get("score_type")
+    if score_type == "quantity":
+        base = int(display.get("base_completed") or 0)
+        target = int(display.get("total_target") or exercise.target_units)
+        current = base + completed
+        extra = f"，已超额完成 {current - target} 次" if current > target else ""
+        return f"进度：{current}/{target}{extra}", {
+            "score_type": "quantity",
+            "base_completed": base,
+            "current_completed": current,
+            "total_target": target,
+        }
+    if score_type == "endurance_raise":
+        base = int(display.get("base_valid_reps") or 0)
+        target = int(display.get("target_reps") or exercise.target_units)
+        current = base + completed
+        return f"有效次数：{current}/{target}", {
+            "score_type": "endurance_raise",
+            "base_valid_reps": base,
+            "current_valid_reps": current,
+            "target_reps": target,
+            "best_angle_deg": display.get("best_angle_deg"),
+            "best_hold_s": display.get("best_hold_s"),
+        }
+    if score_type == "flexion":
+        best = display.get("best_flexion_deg") or 0
+        target = display.get("target_flexion_deg") or 120
+        return f"今日最佳：{float(best):.0f}° / 目标 {float(target):.0f}°", {
+            "score_type": "flexion",
+            "best_flexion_deg": best,
+            "target_flexion_deg": target,
+        }
+    if score_type == "bed_flexion":
+        flexion = display.get("best_flexion_deg") or 0
+        thigh = display.get("best_thigh_raise_deg") or 0
+        return f"今日最佳：大腿 {float(thigh):.0f}°，屈膝 {float(flexion):.0f}°", {
+            "score_type": "bed_flexion",
+            "best_flexion_deg": flexion,
+            "best_thigh_raise_deg": thigh,
+        }
+    return f"进度：{completed}/{exercise.target_units}", {
+        "current_completed": completed,
+        "target_units": exercise.target_units,
+    }
+
+
 def render_training_frame(
     *,
     renderer: TextRenderer,
@@ -4539,10 +4992,17 @@ def render_training_frame(
     extra_lines: list[str],
 ) -> np.ndarray:
     h, w = frame.shape[:2]
+    progress_line, display_progress = display_progress_line(exercise, completed)
+    set_web_status_context(
+        exercise_id=exercise.id,
+        exercise_name=exercise.name,
+        display_progress=display_progress,
+        message=feedback,
+    )
     main_lines = [
         f"{exercise_index + 1}/{total_exercises}  {exercise.name}",
         f"类别：{exercise.category}",
-        f"进度：{completed}/{exercise.target_units}",
+        progress_line,
         feedback,
     ]
     standard_lines = ["动作标准"] + exercise.standard[:3]
@@ -4588,6 +5048,9 @@ def render_summary_frame(
 
 
 def create_session_output_dir() -> Path:
+    if OUTPUT_DIR_OVERRIDE is not None:
+        OUTPUT_DIR_OVERRIDE.mkdir(parents=True, exist_ok=True)
+        return OUTPUT_DIR_OVERRIDE
     output_dir = Path("test_pose") / f"knee_desktop_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
@@ -4715,7 +5178,7 @@ def show_summary_until_quit(
         elif mirror:
             frame = cv2.flip(frame, 1)
         frame = render_summary_frame(renderer, frame, results, result_path)
-        cv2.imshow(WINDOW_NAME, frame)
+        publish_training_frame(frame)
         if poll_training_key(30) == ord("q"):
             break
 
@@ -4779,6 +5242,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="只生成本地 edge-tts 语音缓存，不打开摄像头",
     )
+    parser.add_argument("--session-config", default=None, help="本地网页端传入的真实训练 session 配置 JSON")
+    parser.add_argument("--output-dir", default=None, help="指定本次训练 summary.json 和 metrics_summary.txt 输出目录")
+    parser.add_argument("--web-stream-dir", default=None, help="网页端嵌入模式：把实时识别画面写入该目录，不打开 OpenCV 窗口")
+    parser.add_argument("--web-stream-profile", default="balanced", help="网页端推流 profile：smooth / balanced / quality")
+    parser.add_argument("--web-stream-fps", type=float, default=15.0, help="网页端实时画面推流 FPS，默认 15")
+    parser.add_argument("--web-stream-width", type=int, default=800, help="网页端实时画面宽度，默认 800")
+    parser.add_argument("--web-jpeg-quality", type=int, default=68, help="网页端 JPEG 质量，默认 68")
+    parser.add_argument("--camera-width", type=int, default=None, help="可选摄像头采集宽度，不传则保持默认")
+    parser.add_argument("--camera-height", type=int, default=None, help="可选摄像头采集高度，不传则保持默认")
+    parser.add_argument("--camera-fps", type=float, default=None, help="可选摄像头采集 FPS，不传则保持默认")
     parser.add_argument("--no-mirror", action="store_true", help="关闭摄像头镜像显示")
     parser.add_argument("--list", action="store_true", help="只列出训练动作，不打开摄像头")
     return parser.parse_args()
@@ -4789,19 +5262,33 @@ def main() -> None:
     signal.signal(signal.SIGTERM, request_stop)
 
     args = parse_args()
+    setup_web_stream(
+        args.web_stream_dir,
+        fps=args.web_stream_fps,
+        width=args.web_stream_width,
+        jpeg_quality=args.web_jpeg_quality,
+        stream_profile=args.web_stream_profile,
+    )
+    global OUTPUT_DIR_OVERRIDE
+    OUTPUT_DIR_OVERRIDE = Path(args.output_dir) if args.output_dir else None
+    session_config = load_session_config(args.session_config)
     target_units = max(1, args.target)
     exercise_ids = parse_exercise_ids(args.exercise)
     try:
-        exercises = build_session_exercises(
-            target_units,
-            plan=args.plan,
-            exercise_ids=exercise_ids,
-        )
-        voice_cache_exercises = build_session_exercises(
-            max(target_units, DEFAULT_TARGET_UNITS),
-            plan=args.plan,
-            exercise_ids=exercise_ids,
-        )
+        if session_config:
+            exercises = build_session_config_exercises(session_config)
+            voice_cache_exercises = exercises
+        else:
+            exercises = build_session_exercises(
+                target_units,
+                plan=args.plan,
+                exercise_ids=exercise_ids,
+            )
+            voice_cache_exercises = build_session_exercises(
+                max(target_units, DEFAULT_TARGET_UNITS),
+                plan=args.plan,
+                exercise_ids=exercise_ids,
+            )
     except ValueError as exc:
         print(exc)
         return
@@ -4875,7 +5362,12 @@ def main() -> None:
 
     try:
         try:
-            cap = open_camera(args.camera)
+            cap = open_camera(
+                args.camera,
+                camera_width=args.camera_width,
+                camera_height=args.camera_height,
+                camera_fps=args.camera_fps,
+            )
         except RuntimeError as exc:
             print(f"摄像头启动失败：{exc}")
             print("建议：")
@@ -4889,8 +5381,9 @@ def main() -> None:
             print("3. 分别尝试 --camera 0、--camera 1、--camera 2。")
             print("4. 运行 --list-cameras 查看平台提示，运行 --probe-cameras 探测 OpenCV 序号。")
             return
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, 1280, 720)
+        if not web_stream_enabled():
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
         with mp_pose.Pose(
             model_complexity=1,
@@ -4974,11 +5467,13 @@ def main() -> None:
             )
 
     finally:
+        close_web_publisher()
         speaker.close()
         ACTIVE_SPEAKER = None
         if cap is not None:
             cap.release()
-        cv2.destroyAllWindows()
+        if not web_stream_enabled():
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
