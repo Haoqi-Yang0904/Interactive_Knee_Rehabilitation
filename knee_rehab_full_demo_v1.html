@@ -527,7 +527,7 @@
         body = JSON.stringify(body);
       }
       if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
-      const res = await fetch(path, { ...options, headers, body });
+      const res = await fetch(path, { cache: 'no-store', ...options, headers, body });
       const payload = await res.json().catch(() => ({}));
       if (!res.ok || payload.ok === false) throw new Error(payload.error || res.statusText || '本地 API 请求失败');
       return payload.data;
@@ -622,6 +622,16 @@
       } else {
         renderCurrentSessionView();
       }
+    }
+
+    async function refreshAfterTrainingFinished(finalStatus) {
+      await syncRemoteState(false);
+      if (finalStatus?.completed && session?.role === 'patient') {
+        const source = currentActionDetail?.source || 'plan';
+        showPatientView(source === 'library' || source === 'search' ? 'actions' : 'dashboard');
+        return;
+      }
+      renderAfterRemoteRefresh();
     }
 
     syncRemoteState();
@@ -991,9 +1001,13 @@
       }
       activeTraining.streamType = 'mjpeg_fallback';
       activeTraining.streamUrl = activeTraining.fallbackStreamUrl;
+      latestTrainingStatus = { ...(latestTrainingStatus || {}), streamType: 'mjpeg_fallback' };
       const actionId = activeTraining.actionId || currentActionDetail?.actionId;
-      if (actionId) openActionDetail(actionId, currentActionDetail?.source || 'plan');
-      else renderCurrentSessionView();
+      if (actionId) {
+        if (!refreshCameraBox(actionId)) openActionDetail(actionId, currentActionDetail?.source || 'plan');
+      } else {
+        renderCurrentSessionView();
+      }
     }
     function handleWebRTCConnectionState(state) {
       updateWebRTCStatus(state);
@@ -1108,6 +1122,38 @@
         : `<video id="trainingWebrtcVideo" class="camera-stream" autoplay playsinline muted></video>`;
       return `<div class="media-box camera" id="cameraBox"><span class="media-label">实时拍摄与后台处理结果</span>${isActive ? `${media}<div class="media-controls"><button class="media-control-btn" onclick="sendTrainingCommand('r')">r 重置</button>${activeTraining.mode === 'one_click' ? `<button class="media-control-btn" onclick="sendTrainingCommand('n')">n 下一个</button>` : ''}<button class="media-control-btn" onclick="sendTrainingCommand('q')">q 停止画面</button></div><div class="recognition-status" id="recognitionStatus">${trainingStatusText(status)}<br>${trainingMetricsText(status)}<br>${status.message || ''}</div>` : `<div class="media-placeholder"><span class="big">🎥</span><strong>摄像头实时画面 / 骨架识别叠加</strong><p>点击左侧「开始动作识别」后，WebRTC 低延迟实时画面会显示在这里。</p></div>`}<button class="fullscreen-btn" onclick="enterFullscreen(this.closest('.media-box'))">进入全屏</button></div>`;
     }
+    function refreshCameraBox(actionId) {
+      const box = document.getElementById('cameraBox');
+      if (!box) return false;
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = renderCameraBox(actionId).trim();
+      const next = wrapper.firstElementChild;
+      if (!next) return false;
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+      if (fsEl === box) {
+        box.className = next.className;
+        box.innerHTML = next.innerHTML;
+        updateFullscreenButtons();
+      } else {
+        box.outerHTML = next.outerHTML;
+      }
+      if (activeTraining?.streamType === 'webrtc') setTimeout(attachTrainingRemoteStream, 0);
+      return true;
+    }
+
+    function cameraFrameReadyForFullscreen() {
+      if (!activeTraining) return true;
+      if (activeTraining.streamType === 'mjpeg_fallback') {
+        const img = document.querySelector('#cameraBox img.camera-stream');
+        return !!(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+      }
+      const video = document.getElementById('trainingWebrtcVideo');
+      const hasVideoFrame = !!(video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0);
+      const status = latestTrainingStatus || {};
+      const frameSeq = Number(status.frameSeq ?? status.frame_seq ?? 0);
+      return trainingWebrtcGotTrack && hasVideoFrame && frameSeq > 0;
+    }
+
     function renderActionDetail(actionId, source) {
       const patient = getPatient();
       const a = actions[actionId];
@@ -1123,6 +1169,10 @@
       if (fsEl === el) {
         if (document.exitFullscreen) document.exitFullscreen();
         else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        return;
+      }
+      if (el.id === 'cameraBox' && activeTraining && !cameraFrameReadyForFullscreen()) {
+        showToast('实时画面仍在加载，画面出现后再进入全屏');
         return;
       }
       if (el.requestFullscreen) el.requestFullscreen();
@@ -1235,8 +1285,7 @@
             clearTrainingStatusTimer();
             disposeCameraStreams();
             activeTraining = null;
-            await syncRemoteState(false);
-            renderAfterRemoteRefresh();
+            await refreshAfterTrainingFinished(finalStatus);
             showToast(finalStatus.completed ? '训练结果已更新' : '动作识别已结束，未写入新的训练结果');
           } else {
             const statusEl = document.getElementById('recognitionStatus');
@@ -1269,8 +1318,7 @@
       demoVideoPlaying = false;
       clearTrainingStatusTimer();
       if (actionId) {
-        const box = document.getElementById('cameraBox');
-        if (box) box.outerHTML = renderCameraBox(actionId);
+        refreshCameraBox(actionId);
       }
     }
     async function sendTrainingCommand(command) {
