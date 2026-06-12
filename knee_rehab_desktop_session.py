@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import warnings
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
@@ -1211,7 +1212,9 @@ class WebRTCFrameHub:
             self.last_frame_at = now
             frame_seq = self.frame_seq
             processed_fps = self.processed_fps
+        first_frame = frame_seq == 1
         update_web_status(
+            force=first_frame,
             streamType="webrtc",
             frame_seq=frame_seq,
             frameSeq=frame_seq,
@@ -1220,6 +1223,8 @@ class WebRTCFrameHub:
             processedFps=round(processed_fps, 1),
             webrtcWidth=self.width,
             webrtcFpsTarget=WEBRTC_FPS,
+            hasFrame=True,
+            message="WebRTC 已收到第一帧处理画面。" if first_frame else WEB_STATUS_CONTEXT.get("message", "WebRTC 实时画面服务已就绪。"),
         )
 
     def get_latest(self) -> tuple[np.ndarray | None, int, float]:
@@ -1246,36 +1251,66 @@ class ProcessedVideoTrack(VideoStreamTrack):  # type: ignore[misc, valid-type]
         self.last_frame: np.ndarray | None = None
 
     async def recv(self):  # type: ignore[override]
-        if av is None:
-            raise RuntimeError("当前环境未安装 av，WebRTC 视频不可用。")
-        delay = self.frame_interval - (time.monotonic() - self.last_sent_at)
-        if delay > 0:
-            await asyncio.sleep(delay)
-        frame, seq, age = self.frame_hub.get_latest()
-        if frame is None:
-            frame = self.last_frame
-        if frame is None:
-            frame = np.zeros((540, self.width, 3), dtype=np.uint8)
-            cv2.putText(frame, "Waiting for training frame", (36, 270), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 220), 2)
-        self.last_frame = frame
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-        self.sent_frames += 1
-        now = time.monotonic()
-        if self.last_sent_at:
-            instant_fps = 1.0 / max(now - self.last_sent_at, 1e-6)
-            self.track_fps = instant_fps if self.track_fps <= 0 else self.track_fps * 0.85 + instant_fps * 0.15
-        self.last_sent_at = now
-        video_frame.pts = int((now - self.started_at) * 90000)
-        video_frame.time_base = Fraction(1, 90000)
+        try:
+            if av is None:
+                raise RuntimeError("当前环境未安装 av，WebRTC 视频不可用。")
+            delay = self.frame_interval - (time.monotonic() - self.last_sent_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            frame, seq, age = self.frame_hub.get_latest()
+            if frame is None:
+                frame = self.last_frame
+            if frame is None:
+                frame = np.zeros((540, self.width, 3), dtype=np.uint8)
+                cv2.putText(frame, "Waiting for training frame", (36, 270), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 220), 2)
+            self.last_frame = frame
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            self.sent_frames += 1
+            now = time.monotonic()
+            if self.last_sent_at:
+                instant_fps = 1.0 / max(now - self.last_sent_at, 1e-6)
+                self.track_fps = instant_fps if self.track_fps <= 0 else self.track_fps * 0.85 + instant_fps * 0.15
+            self.last_sent_at = now
+            video_frame.pts = int((now - self.started_at) * 90000)
+            video_frame.time_base = Fraction(1, 90000)
+            update_web_status(
+                streamType="webrtc",
+                frame_seq=seq,
+                frameSeq=seq,
+                latestFrameAgeSeconds=round(age, 3) if math.isfinite(age) else None,
+                webrtcTrackFps=round(self.track_fps, 1),
+            )
+            return video_frame
+        except Exception:
+            update_web_status(
+                force=True,
+                webrtcLastError=traceback.format_exc(limit=6)[-1200:],
+                message="WebRTC 视频轨道发送帧失败。",
+            )
+            raise
+
+
+async def wait_for_ice_gathering_complete(pc, timeout: float = 3.0) -> None:
+    if getattr(pc, "iceGatheringState", None) == "complete":
+        return
+    done = asyncio.Event()
+
+    @pc.on("icegatheringstatechange")
+    async def on_ice_gathering_state_change() -> None:
         update_web_status(
-            streamType="webrtc",
-            frame_seq=seq,
-            frameSeq=seq,
-            latestFrameAgeSeconds=round(age, 3) if math.isfinite(age) else None,
-            webrtcTrackFps=round(self.track_fps, 1),
+            force=True,
+            webrtcIceGatheringState=pc.iceGatheringState,
+            webrtcConnectionState=pc.connectionState,
+            webrtcSignalingState=pc.signalingState,
         )
-        return video_frame
+        if pc.iceGatheringState == "complete":
+            done.set()
+
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        update_web_status(force=True, webrtcIceGatheringState=pc.iceGatheringState, webrtcLastError="ICE gathering timed out")
 
 
 class WebRTCServer:
@@ -1345,22 +1380,55 @@ class WebRTCServer:
             webrtcFpsTarget=self.fps,
             webrtcCodec=self.codec,
             webrtcClients=0,
+            webrtcConnectionState=None,
+            webrtcIceConnectionState=None,
+            webrtcIceGatheringState=None,
+            webrtcSignalingState=None,
+            webrtcLastError=None,
+            hasFrame=False,
             message="WebRTC 实时画面服务已就绪。",
         )
 
     async def _offer(self, request):
-        params = await request.json()
-        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])  # type: ignore[operator]
-        pc = RTCPeerConnection()  # type: ignore[operator]
-        self.pcs.add(pc)
+        try:
+            params = await request.json()
+            update_web_status(force=True, webrtcOfferReceivedAt=datetime.now().isoformat(timespec="milliseconds"), webrtcLastError=None)
+            offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])  # type: ignore[operator]
+            pc = RTCPeerConnection()  # type: ignore[operator]
+            self.pcs.add(pc)
+        except Exception:
+            update_web_status(force=True, webrtcLastError=traceback.format_exc(limit=6)[-1200:], message="WebRTC offer 解析失败。")
+            raise
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange() -> None:
-            update_web_status(webrtcClients=len(self.pcs), webrtcConnectionState=pc.connectionState)
+            update_web_status(
+                force=True,
+                webrtcClients=len(self.pcs),
+                webrtcConnectionState=pc.connectionState,
+                webrtcIceConnectionState=pc.iceConnectionState,
+                webrtcIceGatheringState=pc.iceGatheringState,
+                webrtcSignalingState=pc.signalingState,
+            )
             if pc.connectionState in {"failed", "closed", "disconnected"}:
                 await pc.close()
                 self.pcs.discard(pc)
-                update_web_status(webrtcClients=len(self.pcs), webrtcConnectionState=pc.connectionState)
+                update_web_status(force=True, webrtcClients=len(self.pcs), webrtcConnectionState=pc.connectionState)
+
+        @pc.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange() -> None:
+            update_web_status(
+                force=True,
+                webrtcClients=len(self.pcs),
+                webrtcConnectionState=pc.connectionState,
+                webrtcIceConnectionState=pc.iceConnectionState,
+                webrtcIceGatheringState=pc.iceGatheringState,
+                webrtcSignalingState=pc.signalingState,
+            )
+
+        @pc.on("signalingstatechange")
+        async def on_signalingstatechange() -> None:
+            update_web_status(force=True, webrtcSignalingState=pc.signalingState)
 
         track = ProcessedVideoTrack(self.frame_hub, fps=self.fps, width=self.width)
         sender = pc.addTrack(track)
@@ -1372,14 +1440,60 @@ class WebRTCServer:
                     sender.setCodecPreferences(preferred)
             except Exception:
                 pass
-        await pc.setRemoteDescription(offer)
-        answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        update_web_status(webrtcClients=len(self.pcs), webrtcConnectionState=pc.connectionState)
-        return aiohttp_web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+        try:
+            await pc.setRemoteDescription(offer)
+            update_web_status(
+                force=True,
+                webrtcClients=len(self.pcs),
+                webrtcConnectionState=pc.connectionState,
+                webrtcIceConnectionState=pc.iceConnectionState,
+                webrtcIceGatheringState=pc.iceGatheringState,
+                webrtcSignalingState=pc.signalingState,
+                message="WebRTC offer 已接收，正在创建 answer。",
+            )
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            update_web_status(
+                force=True,
+                webrtcClients=len(self.pcs),
+                webrtcConnectionState=pc.connectionState,
+                webrtcIceConnectionState=pc.iceConnectionState,
+                webrtcIceGatheringState=pc.iceGatheringState,
+                webrtcSignalingState=pc.signalingState,
+                message="WebRTC answer 已生成，正在等待 ICE candidate。",
+            )
+            await wait_for_ice_gathering_complete(pc)
+            update_web_status(
+                force=True,
+                webrtcClients=len(self.pcs),
+                webrtcConnectionState=pc.connectionState,
+                webrtcIceConnectionState=pc.iceConnectionState,
+                webrtcIceGatheringState=pc.iceGatheringState,
+                webrtcSignalingState=pc.signalingState,
+                webrtcAnswerSentAt=datetime.now().isoformat(timespec="milliseconds"),
+                message="WebRTC answer 已返回。",
+            )
+            return aiohttp_web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+        except Exception:
+            update_web_status(
+                force=True,
+                webrtcLastError=traceback.format_exc(limit=8)[-1600:],
+                webrtcClients=len(self.pcs),
+                message="WebRTC offer/answer 协商失败。",
+            )
+            raise
 
     async def _health(self, _request):
         frame, seq, age = self.frame_hub.get_latest()
+        peers = [
+            {
+                "connectionState": getattr(pc, "connectionState", None),
+                "iceConnectionState": getattr(pc, "iceConnectionState", None),
+                "iceGatheringState": getattr(pc, "iceGatheringState", None),
+                "signalingState": getattr(pc, "signalingState", None),
+            }
+            for pc in list(self.pcs)
+        ]
         return aiohttp_web.json_response(
             {
                 "ok": True,
@@ -1388,6 +1502,7 @@ class WebRTCServer:
                 "frameSeq": seq,
                 "latestFrameAgeSeconds": round(age, 3) if math.isfinite(age) else None,
                 "hasFrame": frame is not None,
+                "peers": peers,
             }
         )
 
@@ -1434,16 +1549,30 @@ def setup_webrtc_stream(
     if disabled or not port:
         return
     if not WEBRTC_AVAILABLE:
-        message = "当前环境未安装 aiortc，WebRTC 实时画面不可用，请运行 pip install -r requirements.txt。"
-        print(f"⚠️ {message}")
-        update_web_status(force=True, streamType="mjpeg_fallback", webrtcReady=False, webrtcError=message, message=message)
+        message = "当前环境未安装 aiortc/aiohttp/av，WebRTC 实时画面不可用，请运行 pip install -r requirements.txt。"
+        print(f"警告：{message}")
+        update_web_status(
+            force=True,
+            streamType="mjpeg_fallback",
+            webrtcReady=False,
+            webrtcError=message,
+            webrtcLastError=message,
+            message=message,
+        )
         return
     WEBRTC_FRAME_HUB = WebRTCFrameHub(width=WEBRTC_WIDTH)
     server = WebRTCServer(host=host, port=port, frame_hub=WEBRTC_FRAME_HUB, width=WEBRTC_WIDTH, fps=WEBRTC_FPS, codec=WEBRTC_CODEC)
     if not server.start():
         message = f"WebRTC 服务启动失败：{server.failed}"
-        print(f"⚠️ {message}")
-        update_web_status(force=True, streamType="mjpeg_fallback", webrtcReady=False, webrtcError=message, message=message)
+        print(f"警告：{message}")
+        update_web_status(
+            force=True,
+            streamType="mjpeg_fallback",
+            webrtcReady=False,
+            webrtcError=message,
+            webrtcLastError=message,
+            message=message,
+        )
         WEBRTC_FRAME_HUB = None
         return
     WEBRTC_SERVER = server
@@ -1742,9 +1871,9 @@ def configure_camera_capture(
         try:
             ok = cap.set(prop, value)
             if not ok and label not in {"default width", "default height"}:
-                print(f"⚠️ 摄像头参数 {label}={value:g} 可能未被当前后端接受。")
+                print(f"警告：摄像头参数 {label}={value:g} 可能未被当前后端接受。")
         except Exception as exc:
-            print(f"⚠️ 摄像头参数 {label}={value:g} 设置失败：{exc}")
+            print(f"警告：摄像头参数 {label}={value:g} 设置失败：{exc}")
 
 
 def open_camera(

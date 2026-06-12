@@ -1605,6 +1605,19 @@ def default_training_status(session_id: str, config: dict[str, Any] | None = Non
         "webrtcClients": 0,
         "webrtcWidth": (config or {}).get("webrtc_width") or DEFAULT_WEBRTC_WIDTH,
         "webrtcFpsTarget": (config or {}).get("webrtc_fps") or DEFAULT_WEBRTC_FPS,
+        "webrtcConnectionState": None,
+        "webrtcIceConnectionState": None,
+        "webrtcIceGatheringState": None,
+        "webrtcSignalingState": None,
+        "webrtcOfferReceivedAt": None,
+        "webrtcOfferForwardStartedAt": None,
+        "webrtcAnswerSentAt": None,
+        "webrtcAnswerForwardedAt": None,
+        "webrtcLastError": None,
+        "hasFrame": False,
+        "processedFps": 0,
+        "webrtcTrackFps": 0,
+        "command": None,
         "paused": False,
         "stale": True,
         "exited": False,
@@ -1623,6 +1636,13 @@ def write_status_file(session_dir: Path, status: dict[str, Any]) -> None:
     tmp = session_dir / "status.tmp"
     tmp.write_text(json_dumps(status), encoding="utf-8")
     tmp.replace(session_dir / "status.json")
+
+
+def tail_text(path: Path, limit: int = 4000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[-limit:] if path.exists() else ""
+    except OSError:
+        return ""
 
 
 def read_status_file(session_id: str) -> dict[str, Any]:
@@ -1644,6 +1664,19 @@ def read_status_file(session_id: str) -> dict[str, Any]:
     status.setdefault("webrtcClients", 0)
     status.setdefault("webrtcWidth", DEFAULT_WEBRTC_WIDTH)
     status.setdefault("webrtcFpsTarget", DEFAULT_WEBRTC_FPS)
+    status.setdefault("webrtcConnectionState", None)
+    status.setdefault("webrtcIceConnectionState", None)
+    status.setdefault("webrtcIceGatheringState", None)
+    status.setdefault("webrtcSignalingState", None)
+    status.setdefault("webrtcOfferReceivedAt", None)
+    status.setdefault("webrtcOfferForwardStartedAt", None)
+    status.setdefault("webrtcAnswerSentAt", None)
+    status.setdefault("webrtcAnswerForwardedAt", None)
+    status.setdefault("webrtcLastError", None)
+    status.setdefault("hasFrame", False)
+    status.setdefault("processedFps", 0)
+    status.setdefault("webrtcTrackFps", 0)
+    status.setdefault("command", None)
     latest = session_dir / "latest.jpg"
     now = time.time()
     if status.get("streamType") == "webrtc":
@@ -1664,10 +1697,13 @@ def read_status_file(session_id: str) -> dict[str, Any]:
         status["latestFrameAgeSeconds"] = round(now - latest_mtime, 2) if latest_mtime else None
         status["stale"] = bool(status.get("paused")) is False and (latest_mtime is None or now - latest_mtime > 2.0)
     stderr_path = session_dir / "stderr.log"
-    if stderr_path.exists():
-        tail = stderr_path.read_text(encoding="utf-8", errors="ignore")[-2000:]
-        if tail:
-            status["logTail"] = tail
+    stdout_path = session_dir / "stdout.log"
+    stdout_tail = tail_text(stdout_path)
+    stderr_tail = tail_text(stderr_path)
+    status["stdoutTail"] = stdout_tail
+    status["stderrTail"] = stderr_tail
+    if stderr_tail:
+        status["logTail"] = stderr_tail[-2000:]
     return status
 
 
@@ -1850,6 +1886,8 @@ def launch_real_training(
             stale.unlink()
     cmd = [
         sys.executable,
+        "-X",
+        "utf8",
         str(script),
         "--session-config",
         str(config_path),
@@ -1883,9 +1921,24 @@ def launch_real_training(
         )
     else:
         cmd.append("--disable-webrtc")
+    status = read_status_file(session_id)
+    status["command"] = cmd
+    status["streamType"] = requested_stream_type
+    status["webrtcPort"] = webrtc_port
+    write_status_file(session_dir, status)
     stdout_file = (session_dir / "stdout.log").open("w", encoding="utf-8")
     stderr_file = (session_dir / "stderr.log").open("w", encoding="utf-8")
-    process = subprocess.Popen(cmd, cwd=ROOT, stdout=stdout_file, stderr=stderr_file, text=True)
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    process = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        stdout=stdout_file,
+        stderr=stderr_file,
+        text=True,
+        env=child_env,
+    )
     start_training_watcher(process, session_dir, config, stdout_file, stderr_file)
     stream_type_result = "mjpeg_fallback"
     webrtc_health: dict[str, Any] | None = None
@@ -2239,17 +2292,38 @@ def make_app(mock_training: bool = False):
     @app.post("/api/training/webrtc-offer/<session_id>")
     def training_webrtc_offer(session_id: str):
         payload = request.get_json(force=True, silent=True) or {}
+        session_dir = stream_session_dir(session_id)
         try:
             status = read_status_file(session_id)
+            status["webrtcOfferForwardStartedAt"] = dt_now_iso()
+            status["webrtcLastError"] = None
+            write_status_file(session_dir, status)
             port = status.get("webrtcPort") or status.get("webrtc_port")
             if not port:
+                status["webrtcLastError"] = "该训练 session 没有可用的 WebRTC signaling 端口。"
+                write_status_file(session_dir, status)
                 return api_error("该训练 session 没有可用的 WebRTC signaling 端口。", 404)
             target_url = f"http://127.0.0.1:{int(port)}/offer"
             answer = http_json_request(target_url, payload, timeout=6.0)
+            status = read_status_file(session_id)
+            status["webrtcAnswerForwardedAt"] = dt_now_iso()
+            if not answer.get("sdp"):
+                status["webrtcLastError"] = "WebRTC signaling 返回的 answer 缺少 SDP。"
+                write_status_file(session_dir, status)
+                return api_error(status["webrtcLastError"], 502)
+            status["webrtcAnswerSentAt"] = status.get("webrtcAnswerSentAt") or dt_now_iso()
+            status["webrtcLastError"] = None
+            write_status_file(session_dir, status)
             return jsonify({"ok": True, **answer})
         except urllib.error.URLError as exc:
+            status = read_status_file(session_id)
+            status["webrtcLastError"] = f"WebRTC signaling 转发失败：{exc}"
+            write_status_file(session_dir, status)
             return api_error(f"WebRTC signaling 转发失败：{exc}", 502)
         except Exception as exc:
+            status = read_status_file(session_id)
+            status["webrtcLastError"] = str(exc)
+            write_status_file(session_dir, status)
             return api_error(str(exc), 500)
 
     @app.post("/api/training/control/<session_id>")
@@ -2313,6 +2387,33 @@ def make_app(mock_training: bool = False):
     def therapist_patient_summary():
         patient_id = request.args.get("patient_id") or "p001"
         return api_ok(patient_summary(patient_id))
+
+    @app.get("/api/training/webrtc-debug/<session_id>")
+    def training_webrtc_debug(session_id: str):
+        session_dir = stream_session_dir(session_id)
+        status = read_status_file(session_id)
+        port = status.get("webrtcPort") or status.get("webrtc_port")
+        health = None
+        health_error = None
+        if port:
+            try:
+                health = http_json_request(f"http://127.0.0.1:{int(port)}/health", timeout=1.0)
+            except Exception as exc:
+                health_error = str(exc)
+        return api_ok(
+            {
+                "sessionId": session_id,
+                "sessionDir": str(session_dir),
+                "status": status,
+                "stdoutTail": tail_text(session_dir / "stdout.log"),
+                "stderrTail": tail_text(session_dir / "stderr.log"),
+                "command": status.get("command"),
+                "health": health,
+                "healthError": health_error,
+                "offerEndpoint": f"/api/training/webrtc-offer/{session_id}",
+                "fallbackStreamUrl": f"/api/training-stream/{session_id}",
+            }
+        )
 
     @app.get("/<path:filename>")
     def static_files(filename: str):

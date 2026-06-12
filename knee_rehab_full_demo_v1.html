@@ -351,6 +351,11 @@
     let currentDayDetail = null;
     let trainingPeerConnection = null;
     let trainingRemoteStream = null;
+    let trainingWebrtcGotTrack = false;
+    let trainingWebrtcConnectedAt = null;
+    let trainingWebrtcStartedAt = null;
+    let trainingWebrtcFallbackTimer = null;
+    let trainingWebrtcIntentionalStop = true;
 
     function iconSvg(id) {
       const common = 'class="rehab-icon" viewBox="0 0 64 64" aria-hidden="true"';
@@ -560,7 +565,13 @@
       else if (session?.role === 'therapist') showTherapistView(lastTherapistView || 'patients');
     }
 
-    function stopTrainingWebRTC() {
+    function stopTrainingWebRTC(options = {}) {
+      const intentional = options.intentional !== false;
+      trainingWebrtcIntentionalStop = intentional;
+      if (trainingWebrtcFallbackTimer) {
+        clearTimeout(trainingWebrtcFallbackTimer);
+        trainingWebrtcFallbackTimer = null;
+      }
       const video = document.getElementById('trainingWebrtcVideo');
       if (video) {
         video.pause();
@@ -582,10 +593,13 @@
         trainingPeerConnection.close();
         trainingPeerConnection = null;
       }
+      trainingWebrtcGotTrack = false;
+      trainingWebrtcConnectedAt = null;
+      trainingWebrtcStartedAt = null;
     }
 
     function disposeCameraStreams() {
-      stopTrainingWebRTC();
+      stopTrainingWebRTC({ intentional: true });
       document.querySelectorAll('img.camera-stream').forEach(img => { img.src = ''; });
       document.querySelectorAll('video.camera-stream').forEach(video => {
         video.pause();
@@ -932,28 +946,102 @@
       document.getElementById('content').innerHTML = renderActionDetail(actionId, source);
       setActive(session.role === 'patient' ? 'actions' : 'stats');
       bindSearch();
+      if (activeTraining?.streamType === 'webrtc') {
+        setTimeout(attachTrainingRemoteStream, 0);
+      }
     }
     function renderDemoVideoBox(actionId) {
       const a = actions[actionId];
       return `<div class="media-box" id="demoVideoBox"><span class="media-label">示范视频预留区</span>${demoVideoPlaying ? `<div class="demo-video-playing"><button class="demo-tv-btn" onclick="toggleDemoVideo('${actionId}')" title="停止示范视频"></button><strong>${a.shortName}示范视频播放中</strong><p>当前暂无正式示范素材，这里先保留播放状态；播放期间动作识别会暂停。</p></div>` : `<div class="media-placeholder"><button class="demo-tv-btn" onclick="toggleDemoVideo('${actionId}')" title="播放示范视频"></button><strong>${a.shortName}示范视频</strong><p>点击小电视按钮播放示范视频；播放时会冻结并暂停动作识别，停止播放后继续识别。</p></div>`}<button class="fullscreen-btn" onclick="enterFullscreen(this.closest('.media-box'))">进入全屏</button></div>`;
     }
+    function waitForIceGatheringComplete(pc, timeoutMs = 3000) {
+      if (pc.iceGatheringState === 'complete') return Promise.resolve();
+      return new Promise(resolve => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          pc.removeEventListener('icegatheringstatechange', onStateChange);
+          clearTimeout(timer);
+          resolve();
+        };
+        const onStateChange = () => {
+          if (pc.iceGatheringState === 'complete') finish();
+        };
+        const timer = setTimeout(finish, timeoutMs);
+        pc.addEventListener('icegatheringstatechange', onStateChange);
+      });
+    }
+    function attachTrainingRemoteStream() {
+      const video = document.getElementById('trainingWebrtcVideo');
+      if (!video || !trainingRemoteStream) return;
+      if (video.srcObject !== trainingRemoteStream) {
+        video.srcObject = trainingRemoteStream;
+      }
+      video.play().catch(() => {});
+    }
+    function fallbackToMjpeg(reason) {
+      if (!activeTraining || activeTraining.streamType !== 'webrtc' || activeTraining.webrtcFallbackUsed) return;
+      activeTraining.webrtcFallbackUsed = true;
+      showToast(reason || 'WebRTC 连接失败，切换到 MJPEG 备用流');
+      stopTrainingWebRTC({ intentional: true });
+      if (!activeTraining?.fallbackStreamUrl) {
+        showToast('没有可用的 MJPEG 备用流');
+        return;
+      }
+      activeTraining.streamType = 'mjpeg_fallback';
+      activeTraining.streamUrl = activeTraining.fallbackStreamUrl;
+      const actionId = activeTraining.actionId || currentActionDetail?.actionId;
+      if (actionId) openActionDetail(actionId, currentActionDetail?.source || 'plan');
+      else renderCurrentSessionView();
+    }
+    function handleWebRTCConnectionState(state) {
+      updateWebRTCStatus(state);
+      if (!activeTraining || activeTraining.streamType !== 'webrtc') return;
+      if (state === 'connected') {
+        trainingWebrtcConnectedAt = Date.now();
+        return;
+      }
+      if (state === 'failed') {
+        fallbackToMjpeg('WebRTC 连接失败，已切换到 MJPEG 备用流');
+        return;
+      }
+      if (state === 'disconnected') {
+        setTimeout(() => {
+          if (activeTraining?.streamType === 'webrtc' && trainingPeerConnection?.connectionState === 'disconnected') {
+            fallbackToMjpeg('WebRTC 连接中断超过 3 秒，已切换到 MJPEG 备用流');
+          }
+        }, 3000);
+        return;
+      }
+      if (state === 'closed' && !trainingWebrtcIntentionalStop) {
+        fallbackToMjpeg('WebRTC 连接已关闭，已切换到 MJPEG 备用流');
+      }
+    }
     async function startTrainingWebRTC(sessionInfo) {
-      stopTrainingWebRTC();
+      stopTrainingWebRTC({ intentional: true });
       if (!sessionInfo?.webrtcOfferUrl) throw new Error('WebRTC offer endpoint 不存在');
       const pc = new RTCPeerConnection({ iceServers: [] });
       trainingPeerConnection = pc;
+      trainingWebrtcGotTrack = false;
+      trainingWebrtcConnectedAt = null;
+      trainingWebrtcStartedAt = Date.now();
+      trainingWebrtcIntentionalStop = false;
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.ontrack = event => {
-        const video = document.getElementById('trainingWebrtcVideo');
-        if (!video) return;
         const [stream] = event.streams;
+        trainingWebrtcGotTrack = true;
         trainingRemoteStream = stream;
-        video.srcObject = stream;
-        video.play().catch(() => {});
+        attachTrainingRemoteStream();
       };
-      pc.onconnectionstatechange = () => updateWebRTCStatus(pc.connectionState);
+      pc.onconnectionstatechange = () => handleWebRTCConnectionState(pc.connectionState);
+      pc.oniceconnectionstatechange = () => {
+        latestTrainingStatus = { ...(latestTrainingStatus || {}), webrtcIceConnectionState: pc.iceConnectionState };
+        updateWebRTCStatus(pc.connectionState);
+      };
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      await waitForIceGatheringComplete(pc, 3000);
       const headers = { 'Content-Type': 'application/json' };
       if (apiToken) headers.Authorization = `Bearer ${apiToken}`;
       const resp = await fetch(sessionInfo.webrtcOfferUrl, {
@@ -966,6 +1054,15 @@
         throw new Error(answer.error || 'WebRTC answer failed');
       }
       await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type || 'answer' });
+      trainingWebrtcFallbackTimer = setTimeout(() => {
+        if (!activeTraining || activeTraining.streamType !== 'webrtc') return;
+        const status = latestTrainingStatus || {};
+        const frameSeq = Number(status.frameSeq ?? status.frame_seq ?? 0);
+        const clients = Number(status.webrtcClients ?? 0);
+        if (!trainingWebrtcGotTrack || clients <= 0 || frameSeq <= 0) {
+          fallbackToMjpeg('WebRTC 连接超时，已切换到 MJPEG 备用流');
+        }
+      }, 5000);
     }
     function updateWebRTCStatus(state) {
       const statusEl = document.getElementById('recognitionStatus');
@@ -984,6 +1081,7 @@
         ? `WebRTC 低延迟实时画面 · FPS ${fps} · 延迟 ${age}s`
         : `MJPEG 备用实时画面 · FPS ${fps} · 延迟 ${age}s`;
       if (status.webrtcConnectionState) text += ` · ${status.webrtcConnectionState}`;
+      if (status.webrtcIceConnectionState) text += ` · ICE ${status.webrtcIceConnectionState}`;
       if (Number(status.fps || 0) > 0 && Number(status.fps || 0) < 8) {
         text += '<br>当前画面较卡，正在使用备用流或等待 WebRTC 恢复';
       }
@@ -1102,7 +1200,8 @@
           statusUrl: data.statusUrl,
           controlUrl: data.controlUrl,
           pid: data.pid,
-          startedAt: Date.now()
+          startedAt: Date.now(),
+          webrtcFallbackUsed: false
         };
         latestTrainingStatus = null;
         startTrainingStatusPolling();
@@ -1116,15 +1215,7 @@
           try {
             await startTrainingWebRTC(activeTraining);
           } catch (webrtcErr) {
-            showToast('WebRTC 实时画面连接失败，正在尝试 MJPEG 备用流');
-            stopTrainingWebRTC();
-            if (activeTraining?.fallbackStreamUrl) {
-              activeTraining.streamType = 'mjpeg_fallback';
-              activeTraining.streamUrl = activeTraining.fallbackStreamUrl;
-              if (displayActionId) openActionDetail(displayActionId, 'plan');
-            } else {
-              showToast(webrtcErr.message || 'WebRTC 连接失败，且没有备用流');
-            }
+            fallbackToMjpeg(webrtcErr.message || 'WebRTC 实时画面连接失败，已切换到 MJPEG 备用流');
           }
         }
         showToast(oneClick ? '已启动连续动作识别' : '已启动当前动作识别');
@@ -1152,6 +1243,13 @@
             if (statusEl) {
               const status = latestTrainingStatus || {};
               statusEl.innerHTML = `${trainingStatusText(status)}<br>${trainingMetricsText(status)}<br>${status.message || ''}`;
+            }
+            if (activeTraining?.streamType === 'webrtc') {
+              attachTrainingRemoteStream();
+              const state = latestTrainingStatus.webrtcConnectionState;
+              if (state === 'failed' || state === 'closed') {
+                fallbackToMjpeg(`WebRTC ${state}，已切换到 MJPEG 备用流`);
+              }
             }
           }
         } catch (err) {
